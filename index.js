@@ -3,14 +3,14 @@ const fs = require('fs');
 const path = require('path');
 const express = require('express');
 const { PDFParse } = require('pdf-parse');
-const OpenAI = require('openai');
+const Groq = require('groq-sdk');
 const { logInteraction } = require('./db');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
+const groq = new Groq({
+  apiKey: process.env.GROQ_API_KEY,
 });
 
 app.use(express.json());
@@ -138,8 +138,10 @@ app.post('/ask', async (req, res) => {
       question,
     ].join('\n');
 
-    const completion = await openai.chat.completions.create({
-      model: process.env.OPENAI_MODEL || 'gpt-4o',
+    let model = (process.env.GROQ_MODEL || 'llama-3.3-70b-versatile').replace(/^groq\//i, '');
+    if (model === 'llama-3.1-8b-versatile') model = 'llama-3.1-8b-instant';
+    const completion = await groq.chat.completions.create({
+      model,
       messages: [
         { role: 'system', content: systemPrompt },
         { role: 'user', content: userPrompt },
@@ -163,7 +165,8 @@ app.post('/ask', async (req, res) => {
     });
   } catch (err) {
     console.error('Error handling /ask:', err);
-    res.status(500).json({ error: 'Unexpected server error.' });
+    const message = err?.message || 'Unexpected server error.';
+    res.status(500).json({ error: message });
   }
 });
 

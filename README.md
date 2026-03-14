@@ -1,12 +1,12 @@
 ### PDF Chat Backend (Node.js + Express)
 
-This is a minimal Node.js backend that lets you **ask questions about a local `manual.pdf` file** using a simple RAG (Retrieval‑Augmented Generation) pattern with OpenAI.
+This is a minimal Node.js backend that lets you **ask questions about a local `manual.pdf` file** using a simple RAG (Retrieval‑Augmented Generation) pattern with the **Groq API**.
 
 It:
 - **Parses a local PDF** with `pdf-parse`
 - **Chunks** the PDF text into ~1000‑character segments
 - **Selects the most relevant chunk** for a question using keyword matching
-- **Sends that chunk as context** to the OpenAI Chat Completions API (e.g. `gpt-4o`)
+- **Sends that chunk as context** to the Groq Chat Completions API (e.g. `llama-3.3-70b-versatile`)
 - Exposes a **`POST /ask`** endpoint: `{ "question": "..." }`
 - Optionally **logs Q&A history** into a SQLite database using `knex`
 
@@ -17,7 +17,7 @@ It:
 - **Node.js** 18+ installed
 - **npm** installed
 - A local PDF file named **`manual.pdf`** in the **project root** (same folder as `index.js`)
-- An **OpenAI API key**
+- A **Groq API key** ([get one at console.groq.com](https://console.groq.com))
 
 ---
 
@@ -32,7 +32,7 @@ npm install
 If you don’t have `node_modules` yet (for example on a fresh clone), also run:
 
 ```bash
-npm install express pdf-parse openai dotenv knex sqlite3
+npm install express pdf-parse groq-sdk dotenv knex sqlite3
 ```
 
 ---
@@ -48,17 +48,17 @@ cp .env.example .env
 Then edit `.env`:
 
 ```env
-OPENAI_API_KEY=sk-your-real-key-here
-OPENAI_MODEL=gpt-4o        # or gpt-3.5-turbo, etc.
-PORT=3000                  # optional, defaults to 3000
-DB_FILE=./chat_history.db  # optional, SQLite file for logging chat history
+GROQ_API_KEY=your-groq-api-key-here
+GROQ_MODEL=llama-3.3-70b-versatile   # or llama-3.1-8b-instant, etc.
+PORT=3000                           # optional, defaults to 3000
+DB_FILE=./chat_history.db           # optional, SQLite file for logging chat history
 ```
 
 **Required:**
-- **`OPENAI_API_KEY`** must be set to a valid OpenAI API key.
+- **`GROQ_API_KEY`** must be set to a valid Groq API key.
 
 **Optional:**
-- **`OPENAI_MODEL`** (defaults to `gpt-4o` if not set)
+- **`GROQ_MODEL`** (defaults to `llama-3.3-70b-versatile` if not set)
 - **`PORT`** (defaults to `3000`)
 - **`DB_FILE`** (defaults to `./chat_history.db`)
 
@@ -147,7 +147,7 @@ Example JSON response:
 - **Retrieval**: When you call `/ask`, the server:
   - Scores each chunk by how many question keywords it contains (simple keyword matching).
   - Picks the **highest‑scoring chunk** as the most relevant context.
-- **Generation**: The server calls the **OpenAI Chat Completions API** with:
+- **Generation**: The server calls the **Groq Chat Completions API** with:
   - A **system message** telling the model to rely on the provided context.
   - A **user message** that includes the chosen PDF chunk and your question.
 - The model’s answer is returned as `answer`, plus the `contextPreview` chunk used.
