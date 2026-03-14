@@ -1,0 +1,22 @@
+{
+  "name": "talk-to-a-pdf",
+  "version": "1.0.0",
+  "description": "Simple Express backend to chat with a local PDF using RAG and OpenAI.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "dotenv": "^17.3.1",
+    "express": "^5.2.1",
+    "knex": "^3.1.0",
+    "openai": "^6.27.0",
+    "pdf-parse": "^2.4.5",
+    "sqlite3": "^6.0.1"
+  }
+}

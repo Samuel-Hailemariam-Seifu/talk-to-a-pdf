@@ -1,0 +1,28 @@
+# Dependencies
+node_modules/
+
+# Environment (contains secrets)
+.env
+
+# SQLite database (generated at runtime)
+*.db
+chat_history.db
+
+# Logs
+logs
+*.log
+npm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE / Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Optional: keep .env.example tracked
+!.env.example
