@@ -4,9 +4,10 @@ This is a minimal Node.js backend that lets you **ask questions about a local `m
 
 It:
 - **Parses a local PDF** with `pdf-parse`
-- **Chunks** the PDF text into ~1000‑character segments
-- **Selects the most relevant chunk** for a question using keyword matching
-- **Sends that chunk as context** to the Groq Chat Completions API (e.g. `llama-3.3-70b-versatile`)
+- **Chunks** the PDF with **overlapping windows** (~1000 chars, 200 char overlap) so context isn’t cut mid-sentence
+- **Embeds** each chunk with OpenAI (`text-embedding-3-small`) and **retrieves** the top K chunks by **cosine similarity** to the question
+- **Re-ranks** those chunks with a quick Groq call to pick the best 1–2 for the final answer
+- **Sends the selected chunks** as context to the Groq Chat Completions API (e.g. `llama-3.3-70b-versatile`)
 - Exposes a **`POST /ask`** endpoint: `{ "question": "..." }`
 - Optionally **logs Q&A history** into a SQLite database using `knex`
 
@@ -17,7 +18,8 @@ It:
 - **Node.js** 18+ installed
 - **npm** installed
 - A local PDF file named **`manual.pdf`** in the **project root** (same folder as `index.js`)
-- A **Groq API key** ([get one at console.groq.com](https://console.groq.com))
+- A **Groq API key** ([get one at console.groq.com](https://console.groq.com)) for chat (and re-ranking)
+- An **OpenAI API key** for **embeddings** (used for vector retrieval)
 
 ---
 
@@ -49,18 +51,32 @@ Then edit `.env`:
 
 ```env
 GROQ_API_KEY=your-groq-api-key-here
-GROQ_MODEL=llama-3.3-70b-versatile   # or llama-3.1-8b-instant, etc.
-PORT=3000                           # optional, defaults to 3000
-DB_FILE=./chat_history.db           # optional, SQLite file for logging chat history
+GROQ_MODEL=llama-3.3-70b-versatile
+
+OPENAI_API_KEY=your-openai-api-key-here
+OPENAI_EMBEDDING_MODEL=text-embedding-3-small
+
+# Optional RAG tuning
+# RAG_CHUNK_SIZE=1000
+# RAG_CHUNK_OVERLAP=200
+# RAG_RETRIEVE_TOP_K=5
+# RAG_RERANK_TOP_N=2
+
+PORT=3000
+DB_FILE=./chat_history.db
 ```
 
 **Required:**
-- **`GROQ_API_KEY`** must be set to a valid Groq API key.
+- **`GROQ_API_KEY`** – Groq API key for chat and re-ranking.
+- **`OPENAI_API_KEY`** – OpenAI API key for embeddings (vector retrieval).
 
 **Optional:**
-- **`GROQ_MODEL`** (defaults to `llama-3.3-70b-versatile` if not set)
-- **`PORT`** (defaults to `3000`)
-- **`DB_FILE`** (defaults to `./chat_history.db`)
+- **`GROQ_MODEL`** (defaults to `llama-3.3-70b-versatile`)
+- **`OPENAI_EMBEDDING_MODEL`** (defaults to `text-embedding-3-small`)
+- **`RAG_CHUNK_SIZE`** / **`RAG_CHUNK_OVERLAP`** – chunk size and overlap in characters.
+- **`RAG_RETRIEVE_TOP_K`** – number of chunks to retrieve by similarity (default 5).
+- **`RAG_RERANK_TOP_N`** – number of chunks to keep after re-ranking for the final prompt (default 2).
+- **`PORT`** (defaults to `3000`), **`DB_FILE`** (defaults to `./chat_history.db`)
 
 ---
 
@@ -97,7 +113,7 @@ You should see something like:
 
 ```text
 PDF chat backend listening on http://localhost:3000
-Loaded PDF with X chunks.
+Loaded PDF with X chunks (overlap=200, embeddings ready).
 ```
 
 Health check:
@@ -142,15 +158,13 @@ Example JSON response:
 
 ### 7. How the RAG logic works
 
-- **PDF parsing**: On startup, the server reads `manual.pdf` and uses `pdf-parse` to extract `parsed.text`.
-- **Chunking**: The text is split into **~1000‑character chunks**, roughly by sentence boundaries.
+- **PDF parsing**: On startup, the server reads `manual.pdf` and uses `pdf-parse` to extract text.
+- **Chunking with overlap**: The text is split into **overlapping windows** (e.g. 1000 characters, 200 character overlap) so boundaries don’t cut mid-sentence.
+- **Embeddings**: Each chunk is embedded with **OpenAI** (`text-embedding-3-small`); vectors are kept in memory for similarity search.
 - **Retrieval**: When you call `/ask`, the server:
-  - Scores each chunk by how many question keywords it contains (simple keyword matching).
-  - Picks the **highest‑scoring chunk** as the most relevant context.
-- **Generation**: The server calls the **Groq Chat Completions API** with:
-  - A **system message** telling the model to rely on the provided context.
-  - A **user message** that includes the chosen PDF chunk and your question.
-- The model’s answer is returned as `answer`, plus the `contextPreview` chunk used.
+  - Embeds the question, then **retrieves the top K chunks** (default 5) by **cosine similarity**.
+  - **Re-ranks** those K chunks with a fast Groq call that picks the best 1–2 passages for the answer.
+- **Generation**: The server calls the **Groq Chat Completions API** with the re-ranked chunks as context and your question; the model’s reply is returned as `answer`, with a short `contextPreview`.
 
 This is intentionally simple, but matches the basic **RAG** pattern: *retrieve relevant context → augment the prompt → generate an answer*.
 
