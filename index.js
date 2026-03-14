@@ -2,7 +2,7 @@ require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
 const express = require('express');
-const pdfParse = require('pdf-parse');
+const { PDFParse } = require('pdf-parse');
 const OpenAI = require('openai');
 const { logInteraction } = require('./db');
 
@@ -91,9 +91,11 @@ async function loadPdfOnce() {
     }
 
     const dataBuffer = fs.readFileSync(PDF_PATH);
-    const parsed = await pdfParse(dataBuffer);
+    const parser = new PDFParse({ data: dataBuffer });
+    const textResult = await parser.getText();
+    await parser.destroy();
 
-    pdfChunks = chunkText(parsed.text || '');
+    pdfChunks = chunkText(textResult.text || '');
     pdfTextLoaded = true;
     console.log(`Loaded PDF with ${pdfChunks.length} chunks.`);
   } catch (err) {
