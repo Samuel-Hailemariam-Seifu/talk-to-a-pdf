@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Talk to a PDF</title>
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        margin: 0;
+        background: #f5f7fb;
+        color: #1f2937;
+      }
+      .container {
+        max-width: 760px;
+        margin: 40px auto;
+        padding: 24px;
+        background: #fff;
+        border-radius: 12px;
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.08);
+      }
+      h1 {
+        margin-top: 0;
+        font-size: 24px;
+      }
+      .row {
+        display: flex;
+        gap: 10px;
+      }
+      input[type='text'] {
+        flex: 1;
+        font-size: 16px;
+        padding: 12px;
+        border-radius: 8px;
+        border: 1px solid #cbd5e1;
+      }
+      button {
+        font-size: 16px;
+        padding: 12px 16px;
+        border: none;
+        border-radius: 8px;
+        background: #2563eb;
+        color: #fff;
+        cursor: pointer;
+      }
+      button:disabled {
+        background: #93c5fd;
+        cursor: not-allowed;
+      }
+      .hint {
+        margin-top: 8px;
+        color: #64748b;
+        font-size: 13px;
+      }
+      .panel {
+        margin-top: 20px;
+        padding: 14px;
+        border: 1px solid #e2e8f0;
+        border-radius: 8px;
+        background: #fafafa;
+      }
+      .label {
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        color: #64748b;
+        margin-bottom: 6px;
+      }
+      .answer {
+        white-space: pre-wrap;
+        line-height: 1.5;
+      }
+      .source {
+        margin-top: 10px;
+        padding: 10px;
+        background: #fff;
+        border: 1px solid #e2e8f0;
+        border-radius: 6px;
+      }
+      .error {
+        color: #b91c1c;
+        margin-top: 12px;
+      }
+    </style>
+  </head>
+  <body>
+    <main class="container">
+      <h1>Talk to a PDF</h1>
+      <div class="row">
+        <input id="questionInput" type="text" placeholder="Ask a question about your PDF..." />
+        <button id="askBtn">Ask</button>
+      </div>
+      <div class="hint">Optional: include a document ID if you uploaded multiple PDFs.</div>
+      <div class="row" style="margin-top: 8px">
+        <input id="documentIdInput" type="text" placeholder="document_id (optional, defaults to 'default')" />
+      </div>
+
+      <div id="error" class="error"></div>
+
+      <section id="answerPanel" class="panel" style="display: none">
+        <div class="label">Answer</div>
+        <div id="answerText" class="answer"></div>
+      </section>
+
+      <section id="sourcesPanel" class="panel" style="display: none">
+        <div class="label">Sources</div>
+        <div id="sourcesList"></div>
+      </section>
+    </main>
+
+    <script>
+      const askBtn = document.getElementById('askBtn');
+      const questionInput = document.getElementById('questionInput');
+      const documentIdInput = document.getElementById('documentIdInput');
+      const errorEl = document.getElementById('error');
+      const answerPanel = document.getElementById('answerPanel');
+      const answerText = document.getElementById('answerText');
+      const sourcesPanel = document.getElementById('sourcesPanel');
+      const sourcesList = document.getElementById('sourcesList');
+
+      function setLoading(loading) {
+        askBtn.disabled = loading;
+        askBtn.textContent = loading ? 'Asking...' : 'Ask';
+      }
+
+      function renderSources(sources) {
+        sourcesList.innerHTML = '';
+        if (!Array.isArray(sources) || sources.length === 0) {
+          sourcesPanel.style.display = 'none';
+          return;
+        }
+
+        sourcesPanel.style.display = 'block';
+        for (const source of sources) {
+          const item = document.createElement('div');
+          item.className = 'source';
+          const idx = typeof source.chunk_index === 'number' ? source.chunk_index : 'n/a';
+          const snippet = source.snippet || source.text || '';
+          item.innerHTML = `<strong>Chunk ${idx}</strong><div style="margin-top: 6px; white-space: pre-wrap;">${snippet}</div>`;
+          sourcesList.appendChild(item);
+        }
+      }
+
+      async function askQuestion() {
+        const question = questionInput.value.trim();
+        const documentId = documentIdInput.value.trim();
+        errorEl.textContent = '';
+        answerPanel.style.display = 'none';
+        sourcesPanel.style.display = 'none';
+
+        if (!question) {
+          errorEl.textContent = 'Please enter a question.';
+          return;
+        }
+
+        setLoading(true);
+        try {
+          const body = { question };
+          if (documentId) body.document_id = documentId;
+
+          const response = await fetch('/ask', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+          });
+
+          const data = await response.json();
+          if (!response.ok) throw new Error(data.error || 'Request failed.');
+
+          answerText.textContent = data.answer || '(No answer returned)';
+          answerPanel.style.display = 'block';
+          renderSources(data.sources || []);
+        } catch (err) {
+          errorEl.textContent = err.message || 'Unexpected error.';
+        } finally {
+          setLoading(false);
+        }
+      }
+
+      askBtn.addEventListener('click', askQuestion);
+      questionInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') askQuestion();
+      });
+    </script>
+  </body>
+</html>

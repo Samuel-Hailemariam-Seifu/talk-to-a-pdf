@@ -17,6 +17,7 @@ const groq = new Groq({
 });
 
 app.use(express.json());
+app.use(express.static(path.join(__dirname, 'public')));
 const upload = multer();
 
 const PDF_PATH = path.join(__dirname, 'manual.pdf');
