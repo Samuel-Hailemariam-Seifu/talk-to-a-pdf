@@ -34,6 +34,14 @@
         border-radius: 8px;
         border: 1px solid #cbd5e1;
       }
+      input[type='file'] {
+        flex: 1;
+        font-size: 14px;
+        padding: 10px;
+        border-radius: 8px;
+        border: 1px solid #cbd5e1;
+        background: #fff;
+      }
       button {
         font-size: 16px;
         padding: 12px 16px;
@@ -86,6 +94,13 @@
   <body>
     <main class="container">
       <h1>Talk to a PDF</h1>
+      <div class="label">Upload PDF</div>
+      <div class="row">
+        <input id="pdfFileInput" type="file" accept="application/pdf" />
+        <button id="uploadBtn">Upload</button>
+      </div>
+      <div id="uploadStatus" class="hint"></div>
+
       <div class="row">
         <input id="questionInput" type="text" placeholder="Ask a question about your PDF..." />
         <button id="askBtn">Ask</button>
@@ -110,8 +125,11 @@
 
     <script>
       const askBtn = document.getElementById('askBtn');
+      const uploadBtn = document.getElementById('uploadBtn');
+      const pdfFileInput = document.getElementById('pdfFileInput');
       const questionInput = document.getElementById('questionInput');
       const documentIdInput = document.getElementById('documentIdInput');
+      const uploadStatusEl = document.getElementById('uploadStatus');
       const errorEl = document.getElementById('error');
       const answerPanel = document.getElementById('answerPanel');
       const answerText = document.getElementById('answerText');
@@ -121,6 +139,11 @@
       function setLoading(loading) {
         askBtn.disabled = loading;
         askBtn.textContent = loading ? 'Asking...' : 'Ask';
+      }
+
+      function setUploadLoading(loading) {
+        uploadBtn.disabled = loading;
+        uploadBtn.textContent = loading ? 'Uploading...' : 'Upload';
       }
 
       function renderSources(sources) {
@@ -138,6 +161,37 @@
           const snippet = source.snippet || source.text || '';
           item.innerHTML = `<strong>Chunk ${idx}</strong><div style="margin-top: 6px; white-space: pre-wrap;">${snippet}</div>`;
           sourcesList.appendChild(item);
+        }
+      }
+
+      async function uploadPdf() {
+        const file = pdfFileInput.files?.[0];
+        errorEl.textContent = '';
+        uploadStatusEl.textContent = '';
+        if (!file) {
+          errorEl.textContent = 'Please choose a PDF file to upload.';
+          return;
+        }
+
+        setUploadLoading(true);
+        try {
+          const formData = new FormData();
+          formData.append('file', file);
+
+          const response = await fetch('/upload', {
+            method: 'POST',
+            body: formData,
+          });
+
+          const data = await response.json();
+          if (!response.ok) throw new Error(data.error || 'Upload failed.');
+
+          documentIdInput.value = data.document_id || '';
+          uploadStatusEl.textContent = `Uploaded "${data.source_name}" (${data.chunk_count} chunks). Document ID set.`;
+        } catch (err) {
+          errorEl.textContent = err.message || 'Unexpected upload error.';
+        } finally {
+          setUploadLoading(false);
         }
       }
 
@@ -177,6 +231,7 @@
         }
       }
 
+      uploadBtn.addEventListener('click', uploadPdf);
       askBtn.addEventListener('click', askQuestion);
       questionInput.addEventListener('keydown', (e) => {
         if (e.key === 'Enter') askQuestion();
