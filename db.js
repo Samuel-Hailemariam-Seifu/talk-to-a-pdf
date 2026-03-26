@@ -15,7 +15,6 @@ async function ensureSchema() {
       table.increments('id').primary();
       table.timestamp('created_at').defaultTo(db.fn.now());
       table.text('document_id');
-      table.text('session_id');
       table.text('question').notNullable();
       table.text('answer').notNullable();
       table.text('context_chunk');
@@ -43,15 +42,22 @@ async function ensureSchema() {
     await db.schema.alterTable('chat_history', (table) => {
       table.text('context_sources');
     });
+    return;
+  }
+
+  const hasDocumentId = await db.schema.hasColumn('chat_history', 'document_id');
+  if (!hasDocumentId) {
+    await db.schema.alterTable('chat_history', (table) => {
+      table.text('document_id');
+    });
   }
 }
 
-async function logInteraction({ documentId, sessionId, question, answer, contextChunk, sources }) {
+async function logInteraction({ documentId, question, answer, contextChunk }) {
   try {
     await ensureSchema();
     await db('chat_history').insert({
       document_id: documentId || null,
-      session_id: sessionId || null,
       question,
       answer,
       context_chunk: contextChunk,

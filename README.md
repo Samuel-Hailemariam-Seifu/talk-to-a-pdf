@@ -9,9 +9,8 @@ It:
 - **Re-ranks** those chunks with a quick Groq call to pick the best 1–2 for the final answer
 - **Sends the selected chunks** as context to the Groq Chat Completions API (e.g. `llama-3.3-70b-versatile`)
 - Exposes a **`POST /upload`** endpoint to upload a PDF (multipart `file` or JSON `file_base64`) and receive a `document_id`
-- Exposes a **`POST /ask`** endpoint: `{ "question": "..." }`
-- Exposes a **`POST /ask/stream`** endpoint (SSE) for incremental answer tokens
-- Supports follow-up chat context via optional `session_id` and/or `messages` in `POST /ask`
+- Exposes a **`GET /documents`** endpoint to list loaded documents
+- Exposes **document-scoped ask endpoints**: `POST /ask` with `document_id` or `POST /documents/:id/ask`
 - Optionally **logs Q&A history** into a SQLite database using `knex`
 
 ---
@@ -189,7 +188,36 @@ Uploaded documents are processed in-memory for the current server session.
 
 ---
 
-### 7. Using the `/ask` endpoint
+### 7. Listing loaded documents with `/documents`
+
+Endpoint:
+- **Method**: `GET`
+- **URL**: `http://localhost:3000/documents`
+
+Example response:
+
+```json
+{
+  "documents": [
+    {
+      "document_id": "default",
+      "source_name": "manual.pdf",
+      "chunk_count": 52,
+      "uploaded_at": "2026-03-26T10:40:11.000Z"
+    },
+    {
+      "document_id": "f3c6f5b2-9f87-4ebd-8a9d-9ca2c3d8dbf9",
+      "source_name": "warranty.pdf",
+      "chunk_count": 21,
+      "uploaded_at": "2026-03-26T10:42:12.000Z"
+    }
+  ]
+}
+```
+
+---
+
+### 8. Using the `/ask` endpoints
 
 Endpoint:
 - **Method**: `POST`
@@ -219,20 +247,12 @@ curl -X POST http://localhost:3000/ask \
   -d "{\"question\":\"What are the warranty terms?\", \"document_id\":\"<YOUR_DOCUMENT_ID>\"}"
 ```
 
-Ask with explicit prior messages:
+Alternative document-scoped path:
 
 ```bash
-curl -X POST http://localhost:3000/ask \
+curl -X POST http://localhost:3000/documents/<YOUR_DOCUMENT_ID>/ask \
   -H "Content-Type: application/json" \
-  -d "{\"question\":\"What should I do next?\",\"document_id\":\"<YOUR_DOCUMENT_ID>\",\"messages\":[{\"role\":\"user\",\"content\":\"How do I install this?\"},{\"role\":\"assistant\",\"content\":\"Follow the setup section in chapter 2.\"}]}"
-```
-
-Ask with `session_id` (stored conversation):
-
-```bash
-curl -X POST http://localhost:3000/ask \
-  -H "Content-Type: application/json" \
-  -d "{\"question\":\"What about troubleshooting?\", \"document_id\":\"<YOUR_DOCUMENT_ID>\", \"session_id\":\"session-123\"}"
+  -d "{\"question\":\"What are the warranty terms?\"}"
 ```
 
 Example JSON response:
@@ -255,70 +275,12 @@ Example JSON response:
 
 ---
 
-### 8. Streaming responses with `/ask/stream` (SSE)
-
-Endpoint:
-- **Method**: `POST`
-- **URL**: `http://localhost:3000/ask/stream`
-- **Body**: same shape as `/ask` (`question`, optional `document_id`, `session_id`, `messages`)
-
-SSE event format:
-- `event: token` with JSON payload: `{ "token": "<partial text>" }`
-- `event: done` with JSON payload: final result metadata, full answer, and `sources`
-- `event: error` with JSON payload: `{ "error": "..." }`
-
-Simple browser example:
-
-```html
-<script>
-  async function askStream() {
-    const res = await fetch('http://localhost:3000/ask/stream', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        question: 'Summarize chapter 1',
-        document_id: 'default',
-        session_id: 'demo-session'
-      }),
-    });
-
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-
-      const events = buffer.split('\n\n');
-      buffer = events.pop() || '';
-      for (const evt of events) {
-        const eventType = (evt.match(/^event:\s*(.+)$/m) || [])[1];
-        const dataText = (evt.match(/^data:\s*(.+)$/m) || [])[1];
-        if (!eventType || !dataText) continue;
-        const data = JSON.parse(dataText);
-        if (eventType === 'token') {
-          console.log(data.token);
-        } else if (eventType === 'done') {
-          console.log('Final:', data);
-        } else if (eventType === 'error') {
-          console.error(data.error);
-        }
-      }
-    }
-  }
-</script>
-```
-
----
-
 ### 9. How the RAG logic works
 
-- **PDF parsing**: On startup, the server reads `manual.pdf`; uploaded files can also be added via `/upload`.
+- **PDF parsing**: On startup, the server reads `manual.pdf`; additional files can be added via `/upload`.
 - **Chunking with overlap**: The text is split into **overlapping windows** (e.g. 1000 characters, 200 character overlap) so boundaries don’t cut mid-sentence.
 - **Embeddings**: Each chunk is embedded with **OpenAI** (`text-embedding-3-small`); vectors are kept in memory for similarity search.
-- **Retrieval**: When you call `/ask`, the server:
+- **Retrieval**: When you call a document-scoped ask endpoint, the server:
   - Embeds the question, then **retrieves the top K chunks** (default 5) by **cosine similarity**.
   - **Re-ranks** those K chunks with a fast Groq call that picks the best 1–2 passages for the answer.
 - **Generation**: The server calls the **Groq Chat Completions API** with the re-ranked chunks as context and your question; the model’s reply is returned as `answer`, with a short `contextPreview`.
@@ -336,7 +298,6 @@ This project includes a small `db.js` module using **Knex** with **SQLite**:
   - `id` (auto‑increment)
   - `created_at` (timestamp)
   - `document_id` (text)
-  - `session_id` (text)
   - `question` (text)
   - `answer` (text)
   - `context_chunk` (text)
@@ -345,7 +306,7 @@ This project includes a small `db.js` module using **Knex** with **SQLite**:
 On each successful `/ask` call, the server:
 
 - Ensures the `chat_history` table exists
-- Inserts a new row with the `document_id`, `session_id`, `question`, `answer`, and the `context_chunk` used
+- Inserts a new row with the `document_id`, `question`, `answer`, and the `context_chunk` used
 
 You can inspect the SQLite file (by default `chat_history.db`) with any SQLite client, or with a basic CLI like:
 
