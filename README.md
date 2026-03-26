@@ -79,6 +79,27 @@ DB_FILE=./chat_history.db
 - **`RAG_RETRIEVE_TOP_K`** – number of chunks to retrieve by similarity (default 5).
 - **`RAG_RERANK_TOP_N`** – number of chunks to keep after re-ranking for the final prompt (default 2).
 - **`PORT`** (defaults to `3000`), **`DB_FILE`** (defaults to `./chat_history.db`)
+- Auth settings (all optional, backward-compatible defaults):
+  - `REQUIRE_AUTH=false` (set to `true` to protect endpoints)
+  - `AUTH_ALLOW_API_KEY=true`
+  - `AUTH_ALLOW_JWT=true`
+  - `AUTH_API_KEY` or `AUTH_API_KEYS=key1,key2`
+  - `AUTH_JWT_SECRET` (required for JWT validation)
+- Rate limiting settings (optional):
+  - `ASK_RATE_LIMIT_WINDOW_MS=60000`
+  - `ASK_RATE_LIMIT_IP_MAX=60` (default limit per IP per window)
+  - `ASK_RATE_LIMIT_API_KEY_MAX=120` (default limit per valid API key per window)
+
+When `REQUIRE_AUTH=true`, `/ask` and `/upload` require valid credentials.
+- API key header: `X-API-Key: <key>`
+- Or bearer auth:
+  - API key as bearer: `Authorization: Bearer <api_key>`
+  - JWT as bearer: `Authorization: Bearer <jwt>`
+
+`/ask` and `/ask/stream` are rate-limited. If exceeded, the API returns:
+- `429 Too Many Requests`
+- JSON error: `Rate limit exceeded for IP/API key. Please retry later.`
+- Standard rate limit headers including `RateLimit-*` and `Retry-After`
 
 ---
 
@@ -123,6 +144,12 @@ Health check:
 ```bash
 curl http://localhost:3000/health
 ```
+
+Open the simple web UI:
+
+- Visit `http://localhost:3000`
+- Type a question and click **Ask**
+- Optionally provide `document_id` when querying uploaded PDFs
 
 ---
 
@@ -208,6 +235,7 @@ Example with `curl`:
 ```bash
 curl -X POST http://localhost:3000/ask \
   -H "Content-Type: application/json" \
+  -H "X-API-Key: <your_api_key>" \
   -d "{\"question\": \"How do I reset the device?\"}"
 ```
 
@@ -233,7 +261,15 @@ Example JSON response:
 {
   "answer": "To reset the device, press and hold ...",
   "document_id": "f3c6f5b2-9f87-4ebd-8a9d-9ca2c3d8dbf9",
-  "contextPreview": "The reset procedure is described in section 3.2 ..."
+  "session_id": "session-123",
+  "contextPreview": "The reset procedure is described in section 3.2 ...",
+  "sources": [
+    {
+      "chunk_index": 12,
+      "snippet": "The reset procedure is described in section 3.2 ...",
+      "text": "The reset procedure is described in section 3.2 ..."
+    }
+  ]
 }
 ```
 
@@ -265,6 +301,7 @@ This project includes a small `db.js` module using **Knex** with **SQLite**:
   - `question` (text)
   - `answer` (text)
   - `context_chunk` (text)
+  - `context_sources` (text JSON, includes `chunk_index`, `snippet`, `text`)
 
 On each successful `/ask` call, the server:
 

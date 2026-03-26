@@ -6,6 +6,8 @@ const express = require('express');
 const { PDFParse } = require('pdf-parse');
 const Groq = require('groq-sdk');
 const multer = require('multer');
+const rateLimit = require('express-rate-limit');
+const jwt = require('jsonwebtoken');
 const { logInteraction } = require('./db');
 const { getEmbedding, cosineSimilarity } = require('./lib/embeddings');
 
@@ -17,6 +19,7 @@ const groq = new Groq({
 });
 
 app.use(express.json());
+app.use(express.static(path.join(__dirname, 'public')));
 const upload = multer();
 
 const PDF_PATH = path.join(__dirname, 'manual.pdf');
@@ -25,11 +28,112 @@ const CHUNK_SIZE = Number(process.env.RAG_CHUNK_SIZE) || 1000;
 const CHUNK_OVERLAP = Number(process.env.RAG_CHUNK_OVERLAP) || 200;
 const RETRIEVE_TOP_K = Number(process.env.RAG_RETRIEVE_TOP_K) || 5;
 const RERANK_TOP_N = Number(process.env.RAG_RERANK_TOP_N) || 2;
+const REQUIRE_AUTH = (process.env.REQUIRE_AUTH || 'false').toLowerCase() === 'true';
+const AUTH_ALLOW_API_KEY = (process.env.AUTH_ALLOW_API_KEY || 'true').toLowerCase() === 'true';
+const AUTH_ALLOW_JWT = (process.env.AUTH_ALLOW_JWT || 'true').toLowerCase() === 'true';
+const AUTH_JWT_SECRET = process.env.AUTH_JWT_SECRET || '';
+const ASK_RATE_LIMIT_WINDOW_MS = Number(process.env.ASK_RATE_LIMIT_WINDOW_MS) || 60 * 1000;
+const ASK_RATE_LIMIT_IP_MAX = Number(process.env.ASK_RATE_LIMIT_IP_MAX) || 60;
+const ASK_RATE_LIMIT_API_KEY_MAX = Number(process.env.ASK_RATE_LIMIT_API_KEY_MAX) || 120;
+const API_KEYS = new Set(
+  [process.env.AUTH_API_KEY, ...(process.env.AUTH_API_KEYS || '').split(',')]
+    .filter(Boolean)
+    .map((k) => k.trim())
+    .filter(Boolean)
+);
 
 /** @type {Map<string, { chunks: { text: string, embedding: number[] }[], sourceName?: string, uploadedAt: string }>} */
 const documentStore = new Map();
+/** @type {Map<string, { role: 'user' | 'assistant', content: string }[]>} */
+const sessionStore = new Map();
 let defaultPdfLoaded = false;
 let defaultPdfLoadError = null;
+
+function unauthorized(res, message = 'Unauthorized.') {
+  return res.status(401).json({ error: message });
+}
+
+function requireAuth(req, res, next) {
+  if (!REQUIRE_AUTH) return next();
+
+  const canUseApiKey = AUTH_ALLOW_API_KEY && API_KEYS.size > 0;
+  const canUseJwt = AUTH_ALLOW_JWT && !!AUTH_JWT_SECRET;
+  if (!canUseApiKey && !canUseJwt) {
+    return res.status(500).json({
+      error: 'Authentication enabled but not configured. Set AUTH_API_KEY/AUTH_API_KEYS and/or AUTH_JWT_SECRET.',
+    });
+  }
+
+  const xApiKey = req.get('x-api-key');
+  if (canUseApiKey && xApiKey && API_KEYS.has(xApiKey.trim())) {
+    req.auth = { type: 'api_key' };
+    return next();
+  }
+
+  const authHeader = req.get('authorization') || '';
+  if (authHeader.startsWith('Bearer ')) {
+    const token = authHeader.slice('Bearer '.length).trim();
+
+    if (canUseApiKey && API_KEYS.has(token)) {
+      req.auth = { type: 'api_key' };
+      return next();
+    }
+
+    if (canUseJwt) {
+      try {
+        const payload = jwt.verify(token, AUTH_JWT_SECRET);
+        req.auth = { type: 'jwt', payload };
+        return next();
+      } catch (err) {
+        return unauthorized(res, 'Invalid authentication token.');
+      }
+    }
+  }
+
+  return unauthorized(res, 'Missing or invalid authentication credentials.');
+}
+
+function getRawBearerToken(req) {
+  const authHeader = req.get('authorization') || '';
+  if (!authHeader.startsWith('Bearer ')) return null;
+  return authHeader.slice('Bearer '.length).trim();
+}
+
+function getProvidedApiKey(req) {
+  const xApiKey = req.get('x-api-key');
+  if (xApiKey && API_KEYS.has(xApiKey.trim())) return xApiKey.trim();
+  const bearer = getRawBearerToken(req);
+  if (bearer && API_KEYS.has(bearer)) return bearer;
+  return null;
+}
+
+function makeLimiter(maxRequests, namespace) {
+  return rateLimit({
+    windowMs: ASK_RATE_LIMIT_WINDOW_MS,
+    max: maxRequests,
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: (req) => {
+      const apiKey = getProvidedApiKey(req);
+      if (apiKey) return `${namespace}:key:${apiKey}`;
+      return `${namespace}:ip:${req.ip}`;
+    },
+    handler: (req, res) => {
+      const hasApiKey = !!getProvidedApiKey(req);
+      const scope = hasApiKey ? 'API key' : 'IP';
+      return res.status(429).json({
+        error: `Rate limit exceeded for ${scope}. Please retry later.`,
+      });
+    },
+  });
+}
+
+const askLimiterByIp = makeLimiter(ASK_RATE_LIMIT_IP_MAX, 'ask');
+const askLimiterByApiKey = makeLimiter(ASK_RATE_LIMIT_API_KEY_MAX, 'ask');
+function askRateLimit(req, res, next) {
+  if (getProvidedApiKey(req)) return askLimiterByApiKey(req, res, next);
+  return askLimiterByIp(req, res, next);
+}
 
 /**
  * Chunk text with overlapping windows (e.g. 1000 chars with 200 overlap).
@@ -72,11 +176,11 @@ async function retrieveTopChunks(question, chunks, k = RETRIEVE_TOP_K) {
  * @param {string} question
  * @param {{ text: string, index: number }[]} chunks
  * @param {number} topN
- * @returns {Promise<string[]>}
+ * @returns {Promise<{ text: string, index: number }[]>}
  */
 async function rerankChunks(question, chunks, topN = RERANK_TOP_N) {
   if (chunks.length === 0) return [];
-  if (chunks.length <= topN) return chunks.map((c) => c.text);
+  if (chunks.length <= topN) return chunks.slice(0, topN).map((c) => ({ text: c.text, index: c.index }));
 
   const passageList = chunks
     .map((c, i) => `[${i + 1}]\n${c.text.slice(0, 400)}${c.text.length > 400 ? '...' : ''}`)
@@ -116,10 +220,10 @@ async function rerankChunks(question, chunks, topN = RERANK_TOP_N) {
     const idx = n - 1;
     if (!seen.has(idx)) {
       seen.add(idx);
-      selected.push(chunks[idx].text);
+      selected.push({ text: chunks[idx].text, index: chunks[idx].index });
     }
   }
-  if (selected.length === 0) return chunks.slice(0, topN).map((c) => c.text);
+  if (selected.length === 0) return chunks.slice(0, topN).map((c) => ({ text: c.text, index: c.index }));
   return selected;
 }
 
@@ -151,12 +255,6 @@ async function loadDefaultPdfOnce() {
       throw new Error(`PDF file not found at ${PDF_PATH}`);
     }
 
-    if (!process.env.OPENAI_API_KEY) {
-      throw new Error(
-        'OPENAI_API_KEY is required for embedding-based RAG. Add it to your .env (see .env.example).'
-      );
-    }
-
     const dataBuffer = fs.readFileSync(PDF_PATH);
     const chunks = await processPdfBuffer(dataBuffer, path.basename(PDF_PATH));
     documentStore.set('default', {
@@ -168,7 +266,11 @@ async function loadDefaultPdfOnce() {
     console.log(`Loaded default PDF with ${chunks.length} chunks (overlap=${CHUNK_OVERLAP}, embeddings ready).`);
   } catch (err) {
     defaultPdfLoadError = err;
-    console.error('Failed to load default PDF:', err);
+    if (err?.message && err.message.includes('PDF file not found')) {
+      console.warn('No default manual.pdf found. Upload a PDF via /upload to start querying documents.');
+    } else {
+      console.error('Failed to load default PDF:', err);
+    }
   }
 }
 
@@ -239,12 +341,6 @@ async function handleAsk(question, requestedDocumentId) {
 
 app.post('/upload', upload.single('file'), async (req, res) => {
   try {
-    if (!process.env.OPENAI_API_KEY) {
-      return res.status(500).json({
-        error: 'OPENAI_API_KEY is required for embedding-based RAG. Add it to your .env (see .env.example).',
-      });
-    }
-
     let fileBuffer = req.file?.buffer;
     let sourceName = req.file?.originalname || 'uploaded.pdf';
 
@@ -282,9 +378,9 @@ app.post('/upload', upload.single('file'), async (req, res) => {
   }
 });
 
-app.post('/ask', async (req, res) => {
+app.post('/ask', askRateLimit, requireAuth, async (req, res) => {
   try {
-    const { question, document_id } = req.body || {};
+    const { question, document_id, session_id, messages } = req.body || {};
 
     if (!question || typeof question !== 'string') {
       return res.status(400).json({ error: 'Request body must contain a string field "question".' });
@@ -329,6 +425,7 @@ app.post('/documents/:id/ask', async (req, res) => {
       question,
       answer,
       contextChunk: context,
+      sources,
     }).catch((err) => {
       console.error('Failed to log chat interaction:', err);
     });
@@ -336,7 +433,11 @@ app.post('/documents/:id/ask', async (req, res) => {
     res.json({
       answer,
       document_id: requestedDocumentId,
-      contextPreview: selectedChunks[0] ? selectedChunks[0].slice(0, 300) + (selectedChunks[0].length > 300 ? '...' : '') : null,
+      session_id: sessionId,
+      contextPreview: selectedChunks[0]
+        ? selectedChunks[0].text.slice(0, 300) + (selectedChunks[0].text.length > 300 ? '...' : '')
+        : null,
+      sources,
     });
   } catch (err) {
     console.error('Error handling /documents/:id/ask:', err);
