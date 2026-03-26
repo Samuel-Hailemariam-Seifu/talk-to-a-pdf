@@ -10,6 +10,8 @@ It:
 - **Sends the selected chunks** as context to the Groq Chat Completions API (e.g. `llama-3.3-70b-versatile`)
 - Exposes a **`POST /upload`** endpoint to upload a PDF (multipart `file` or JSON `file_base64`) and receive a `document_id`
 - Exposes a **`POST /ask`** endpoint: `{ "question": "..." }`
+- Exposes a **`POST /ask/stream`** endpoint (SSE) for incremental answer tokens
+- Supports follow-up chat context via optional `session_id` and/or `messages` in `POST /ask`
 - Optionally **logs Q&A history** into a SQLite database using `knex`
 
 ---
@@ -135,6 +137,12 @@ Health check:
 curl http://localhost:3000/health
 ```
 
+Open the simple web UI:
+
+- Visit `http://localhost:3000`
+- Type a question and click **Ask**
+- Optionally provide `document_id` when querying uploaded PDFs
+
 ---
 
 ### 6. Uploading PDFs with `/upload`
@@ -202,19 +210,101 @@ curl -X POST http://localhost:3000/ask \
   -d "{\"question\":\"What are the warranty terms?\", \"document_id\":\"<YOUR_DOCUMENT_ID>\"}"
 ```
 
+Ask with explicit prior messages:
+
+```bash
+curl -X POST http://localhost:3000/ask \
+  -H "Content-Type: application/json" \
+  -d "{\"question\":\"What should I do next?\",\"document_id\":\"<YOUR_DOCUMENT_ID>\",\"messages\":[{\"role\":\"user\",\"content\":\"How do I install this?\"},{\"role\":\"assistant\",\"content\":\"Follow the setup section in chapter 2.\"}]}"
+```
+
+Ask with `session_id` (stored conversation):
+
+```bash
+curl -X POST http://localhost:3000/ask \
+  -H "Content-Type: application/json" \
+  -d "{\"question\":\"What about troubleshooting?\", \"document_id\":\"<YOUR_DOCUMENT_ID>\", \"session_id\":\"session-123\"}"
+```
+
 Example JSON response:
 
 ```json
 {
   "answer": "To reset the device, press and hold ...",
   "document_id": "f3c6f5b2-9f87-4ebd-8a9d-9ca2c3d8dbf9",
-  "contextPreview": "The reset procedure is described in section 3.2 ..."
+  "session_id": "session-123",
+  "contextPreview": "The reset procedure is described in section 3.2 ...",
+  "sources": [
+    {
+      "chunk_index": 12,
+      "snippet": "The reset procedure is described in section 3.2 ...",
+      "text": "The reset procedure is described in section 3.2 ..."
+    }
+  ]
 }
 ```
 
 ---
 
-### 8. How the RAG logic works
+### 8. Streaming responses with `/ask/stream` (SSE)
+
+Endpoint:
+- **Method**: `POST`
+- **URL**: `http://localhost:3000/ask/stream`
+- **Body**: same shape as `/ask` (`question`, optional `document_id`, `session_id`, `messages`)
+
+SSE event format:
+- `event: token` with JSON payload: `{ "token": "<partial text>" }`
+- `event: done` with JSON payload: final result metadata, full answer, and `sources`
+- `event: error` with JSON payload: `{ "error": "..." }`
+
+Simple browser example:
+
+```html
+<script>
+  async function askStream() {
+    const res = await fetch('http://localhost:3000/ask/stream', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        question: 'Summarize chapter 1',
+        document_id: 'default',
+        session_id: 'demo-session'
+      }),
+    });
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      const events = buffer.split('\n\n');
+      buffer = events.pop() || '';
+      for (const evt of events) {
+        const eventType = (evt.match(/^event:\s*(.+)$/m) || [])[1];
+        const dataText = (evt.match(/^data:\s*(.+)$/m) || [])[1];
+        if (!eventType || !dataText) continue;
+        const data = JSON.parse(dataText);
+        if (eventType === 'token') {
+          console.log(data.token);
+        } else if (eventType === 'done') {
+          console.log('Final:', data);
+        } else if (eventType === 'error') {
+          console.error(data.error);
+        }
+      }
+    }
+  }
+</script>
+```
+
+---
+
+### 9. How the RAG logic works
 
 - **PDF parsing**: On startup, the server reads `manual.pdf`; uploaded files can also be added via `/upload`.
 - **Chunking with overlap**: The text is split into **overlapping windows** (e.g. 1000 characters, 200 character overlap) so boundaries don’t cut mid-sentence.
@@ -228,7 +318,7 @@ This is intentionally simple, but matches the basic **RAG** pattern: *retrieve r
 
 ---
 
-### 9. Database logging (bonus)
+### 10. Database logging (bonus)
 
 This project includes a small `db.js` module using **Knex** with **SQLite**:
 
@@ -236,14 +326,17 @@ This project includes a small `db.js` module using **Knex** with **SQLite**:
 - Table: `chat_history`
   - `id` (auto‑increment)
   - `created_at` (timestamp)
+  - `document_id` (text)
+  - `session_id` (text)
   - `question` (text)
   - `answer` (text)
   - `context_chunk` (text)
+  - `context_sources` (text JSON, includes `chunk_index`, `snippet`, `text`)
 
 On each successful `/ask` call, the server:
 
 - Ensures the `chat_history` table exists
-- Inserts a new row with the `question`, `answer`, and the `context_chunk` used
+- Inserts a new row with the `document_id`, `session_id`, `question`, `answer`, and the `context_chunk` used
 
 You can inspect the SQLite file (by default `chat_history.db`) with any SQLite client, or with a basic CLI like:
 
@@ -255,7 +348,7 @@ If you want to adapt this to another SQL database (PostgreSQL, MySQL, etc.), adj
 
 ---
 
-### 10. Notes and next steps
+### 11. Notes and next steps
 
 - This is a **minimal RAG example**. For better relevance:
   - Replace keyword scoring with **embeddings + vector search**.

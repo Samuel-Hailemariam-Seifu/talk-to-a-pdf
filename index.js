@@ -18,6 +18,7 @@ const groq = new Groq({
 });
 
 app.use(express.json());
+app.use(express.static(path.join(__dirname, 'public')));
 const upload = multer();
 
 const PDF_PATH = path.join(__dirname, 'manual.pdf');
@@ -39,6 +40,8 @@ const API_KEYS = new Set(
 
 /** @type {Map<string, { chunks: { text: string, embedding: number[] }[], sourceName?: string, uploadedAt: string }>} */
 const documentStore = new Map();
+/** @type {Map<string, { role: 'user' | 'assistant', content: string }[]>} */
+const sessionStore = new Map();
 let defaultPdfLoaded = false;
 let defaultPdfLoadError = null;
 
@@ -127,11 +130,11 @@ async function retrieveTopChunks(question, chunks, k = RETRIEVE_TOP_K) {
  * @param {string} question
  * @param {{ text: string, index: number }[]} chunks
  * @param {number} topN
- * @returns {Promise<string[]>}
+ * @returns {Promise<{ text: string, index: number }[]>}
  */
 async function rerankChunks(question, chunks, topN = RERANK_TOP_N) {
   if (chunks.length === 0) return [];
-  if (chunks.length <= topN) return chunks.map((c) => c.text);
+  if (chunks.length <= topN) return chunks.slice(0, topN).map((c) => ({ text: c.text, index: c.index }));
 
   const passageList = chunks
     .map((c, i) => `[${i + 1}]\n${c.text.slice(0, 400)}${c.text.length > 400 ? '...' : ''}`)
@@ -171,10 +174,10 @@ async function rerankChunks(question, chunks, topN = RERANK_TOP_N) {
     const idx = n - 1;
     if (!seen.has(idx)) {
       seen.add(idx);
-      selected.push(chunks[idx].text);
+      selected.push({ text: chunks[idx].text, index: chunks[idx].index });
     }
   }
-  if (selected.length === 0) return chunks.slice(0, topN).map((c) => c.text);
+  if (selected.length === 0) return chunks.slice(0, topN).map((c) => ({ text: c.text, index: c.index }));
   return selected;
 }
 
@@ -206,12 +209,6 @@ async function loadDefaultPdfOnce() {
       throw new Error(`PDF file not found at ${PDF_PATH}`);
     }
 
-    if (!process.env.OPENAI_API_KEY) {
-      throw new Error(
-        'OPENAI_API_KEY is required for embedding-based RAG. Add it to your .env (see .env.example).'
-      );
-    }
-
     const dataBuffer = fs.readFileSync(PDF_PATH);
     const chunks = await processPdfBuffer(dataBuffer, path.basename(PDF_PATH));
     documentStore.set('default', {
@@ -223,18 +220,16 @@ async function loadDefaultPdfOnce() {
     console.log(`Loaded default PDF with ${chunks.length} chunks (overlap=${CHUNK_OVERLAP}, embeddings ready).`);
   } catch (err) {
     defaultPdfLoadError = err;
-    console.error('Failed to load default PDF:', err);
+    if (err?.message && err.message.includes('PDF file not found')) {
+      console.warn('No default manual.pdf found. Upload a PDF via /upload to start querying documents.');
+    } else {
+      console.error('Failed to load default PDF:', err);
+    }
   }
 }
 
 app.post('/upload', requireAuth, upload.single('file'), async (req, res) => {
   try {
-    if (!process.env.OPENAI_API_KEY) {
-      return res.status(500).json({
-        error: 'OPENAI_API_KEY is required for embedding-based RAG. Add it to your .env (see .env.example).',
-      });
-    }
-
     let fileBuffer = req.file?.buffer;
     let sourceName = req.file?.originalname || 'uploaded.pdf';
 
@@ -274,67 +269,41 @@ app.post('/upload', requireAuth, upload.single('file'), async (req, res) => {
 
 app.post('/ask', requireAuth, async (req, res) => {
   try {
-    const { question, document_id } = req.body || {};
+    const { question, document_id, session_id, messages } = req.body || {};
 
     if (!question || typeof question !== 'string') {
       return res.status(400).json({ error: 'Request body must contain a string field "question".' });
     }
 
-    await loadDefaultPdfOnce();
-
-    if (defaultPdfLoadError) {
-      return res.status(500).json({
-        error: defaultPdfLoadError.message || 'Failed to load PDF. Check server logs for details.',
-      });
-    }
-
-    const requestedDocumentId =
-      typeof document_id === 'string' && document_id.trim() ? document_id.trim() : 'default';
-    const doc = documentStore.get(requestedDocumentId);
-    if (!doc) {
-      return res.status(404).json({ error: `Document not found for document_id "${requestedDocumentId}".` });
-    }
-
-    if (doc.chunks.length === 0) {
-      return res.status(500).json({ error: 'Document has no available chunks.' });
-    }
-
-    const retrieved = await retrieveTopChunks(question, doc.chunks, RETRIEVE_TOP_K);
-    const selectedChunks = await rerankChunks(question, retrieved, RERANK_TOP_N);
-    const context = selectedChunks.join('\n\n---\n\n');
-
-    const systemPrompt =
-      'You are a helpful assistant that answers questions based primarily on the provided PDF manual context. ' +
-      'If the answer is not clearly supported by the context, say you are not sure and avoid making things up.';
-
-    const userPrompt = [
-      'PDF Context:',
-      '"""',
-      context || 'No relevant context found.',
-      '"""',
-      '',
-      'User question:',
-      question,
-    ].join('\n');
+    const requestedDocumentId = resolveRequestedDocumentId(document_id);
+    const { selectedChunks, context, sources } = await resolveDocumentContext(question, requestedDocumentId);
+    const { systemPrompt, userPrompt } = buildAskPrompts(question, context);
 
     let model = (process.env.GROQ_MODEL || 'llama-3.3-70b-versatile').replace(/^groq\//i, '');
     if (model === 'llama-3.1-8b-versatile') model = 'llama-3.1-8b-instant';
+
+    const { sessionId, priorMessages } = resolveConversationContext(session_id, messages);
 
     const completion = await groq.chat.completions.create({
       model,
       messages: [
         { role: 'system', content: systemPrompt },
+        ...priorMessages,
         { role: 'user', content: userPrompt },
       ],
       temperature: 0.2,
     });
 
     const answer = completion.choices?.[0]?.message?.content?.trim() || '';
+    saveSessionTurn(sessionId, priorMessages, question, answer);
 
     logInteraction({
+      documentId: requestedDocumentId,
+      sessionId,
       question,
       answer,
       contextChunk: context,
+      sources,
     }).catch((err) => {
       console.error('Failed to log chat interaction:', err);
     });
@@ -342,12 +311,97 @@ app.post('/ask', requireAuth, async (req, res) => {
     res.json({
       answer,
       document_id: requestedDocumentId,
-      contextPreview: selectedChunks[0] ? selectedChunks[0].slice(0, 300) + (selectedChunks[0].length > 300 ? '...' : '') : null,
+      session_id: sessionId,
+      contextPreview: selectedChunks[0]
+        ? selectedChunks[0].text.slice(0, 300) + (selectedChunks[0].text.length > 300 ? '...' : '')
+        : null,
+      sources,
     });
   } catch (err) {
     console.error('Error handling /ask:', err);
     const message = err?.message || 'Unexpected server error.';
-    res.status(500).json({ error: message });
+    res.status(err?.statusCode || 500).json({ error: message });
+  }
+});
+
+app.post('/ask/stream', async (req, res) => {
+  try {
+    const { question, document_id, session_id, messages } = req.body || {};
+
+    if (!question || typeof question !== 'string') {
+      return res.status(400).json({ error: 'Request body must contain a string field "question".' });
+    }
+
+    const requestedDocumentId = resolveRequestedDocumentId(document_id);
+    const { selectedChunks, context, sources } = await resolveDocumentContext(question, requestedDocumentId);
+    const { systemPrompt, userPrompt } = buildAskPrompts(question, context);
+    const { sessionId, priorMessages } = resolveConversationContext(session_id, messages);
+
+    let model = (process.env.GROQ_MODEL || 'llama-3.3-70b-versatile').replace(/^groq\//i, '');
+    if (model === 'llama-3.1-8b-versatile') model = 'llama-3.1-8b-instant';
+
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders();
+
+    const stream = await groq.chat.completions.create({
+      model,
+      stream: true,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        ...priorMessages,
+        { role: 'user', content: userPrompt },
+      ],
+      temperature: 0.2,
+    });
+
+    let answer = '';
+    let clientClosed = false;
+    req.on('close', () => {
+      clientClosed = true;
+    });
+
+    for await (const chunk of stream) {
+      if (clientClosed) break;
+      const delta = chunk?.choices?.[0]?.delta?.content || '';
+      if (!delta) continue;
+      answer += delta;
+      res.write(`event: token\ndata: ${JSON.stringify({ token: delta })}\n\n`);
+    }
+
+    if (!clientClosed) {
+      saveSessionTurn(sessionId, priorMessages, question, answer);
+      await logInteraction({
+        documentId: requestedDocumentId,
+        sessionId,
+        question,
+        answer,
+        contextChunk: context,
+        sources,
+      });
+
+      res.write(
+        `event: done\ndata: ${JSON.stringify({
+          answer,
+          document_id: requestedDocumentId,
+          session_id: sessionId,
+          contextPreview: selectedChunks[0]
+            ? selectedChunks[0].text.slice(0, 300) + (selectedChunks[0].text.length > 300 ? '...' : '')
+            : null,
+          sources,
+        })}\n\n`
+      );
+      res.end();
+    }
+  } catch (err) {
+    console.error('Error handling /ask/stream:', err);
+    if (!res.headersSent) {
+      res.status(err?.statusCode || 500).json({ error: err?.message || 'Unexpected server error.' });
+      return;
+    }
+    res.write(`event: error\ndata: ${JSON.stringify({ error: err?.message || 'Unexpected server error.' })}\n\n`);
+    res.end();
   }
 });
 
