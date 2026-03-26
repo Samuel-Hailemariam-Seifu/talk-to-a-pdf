@@ -125,6 +125,12 @@ Health check:
 curl http://localhost:3000/health
 ```
 
+Open the simple web UI:
+
+- Visit `http://localhost:3000`
+- Type a question and click **Ask**
+- Optionally provide `document_id` when querying uploaded PDFs
+
 ---
 
 ### 6. Uploading PDFs with `/upload`
