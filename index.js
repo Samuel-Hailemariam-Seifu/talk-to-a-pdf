@@ -6,6 +6,7 @@ const express = require('express');
 const { PDFParse } = require('pdf-parse');
 const Groq = require('groq-sdk');
 const multer = require('multer');
+const rateLimit = require('express-rate-limit');
 const jwt = require('jsonwebtoken');
 const { logInteraction } = require('./db');
 const { getEmbedding, cosineSimilarity } = require('./lib/embeddings');
@@ -31,6 +32,9 @@ const REQUIRE_AUTH = (process.env.REQUIRE_AUTH || 'false').toLowerCase() === 'tr
 const AUTH_ALLOW_API_KEY = (process.env.AUTH_ALLOW_API_KEY || 'true').toLowerCase() === 'true';
 const AUTH_ALLOW_JWT = (process.env.AUTH_ALLOW_JWT || 'true').toLowerCase() === 'true';
 const AUTH_JWT_SECRET = process.env.AUTH_JWT_SECRET || '';
+const ASK_RATE_LIMIT_WINDOW_MS = Number(process.env.ASK_RATE_LIMIT_WINDOW_MS) || 60 * 1000;
+const ASK_RATE_LIMIT_IP_MAX = Number(process.env.ASK_RATE_LIMIT_IP_MAX) || 60;
+const ASK_RATE_LIMIT_API_KEY_MAX = Number(process.env.ASK_RATE_LIMIT_API_KEY_MAX) || 120;
 const API_KEYS = new Set(
   [process.env.AUTH_API_KEY, ...(process.env.AUTH_API_KEYS || '').split(',')]
     .filter(Boolean)
@@ -87,6 +91,48 @@ function requireAuth(req, res, next) {
   }
 
   return unauthorized(res, 'Missing or invalid authentication credentials.');
+}
+
+function getRawBearerToken(req) {
+  const authHeader = req.get('authorization') || '';
+  if (!authHeader.startsWith('Bearer ')) return null;
+  return authHeader.slice('Bearer '.length).trim();
+}
+
+function getProvidedApiKey(req) {
+  const xApiKey = req.get('x-api-key');
+  if (xApiKey && API_KEYS.has(xApiKey.trim())) return xApiKey.trim();
+  const bearer = getRawBearerToken(req);
+  if (bearer && API_KEYS.has(bearer)) return bearer;
+  return null;
+}
+
+function makeLimiter(maxRequests, namespace) {
+  return rateLimit({
+    windowMs: ASK_RATE_LIMIT_WINDOW_MS,
+    max: maxRequests,
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: (req) => {
+      const apiKey = getProvidedApiKey(req);
+      if (apiKey) return `${namespace}:key:${apiKey}`;
+      return `${namespace}:ip:${req.ip}`;
+    },
+    handler: (req, res) => {
+      const hasApiKey = !!getProvidedApiKey(req);
+      const scope = hasApiKey ? 'API key' : 'IP';
+      return res.status(429).json({
+        error: `Rate limit exceeded for ${scope}. Please retry later.`,
+      });
+    },
+  });
+}
+
+const askLimiterByIp = makeLimiter(ASK_RATE_LIMIT_IP_MAX, 'ask');
+const askLimiterByApiKey = makeLimiter(ASK_RATE_LIMIT_API_KEY_MAX, 'ask');
+function askRateLimit(req, res, next) {
+  if (getProvidedApiKey(req)) return askLimiterByApiKey(req, res, next);
+  return askLimiterByIp(req, res, next);
 }
 
 /**
@@ -267,7 +313,7 @@ app.post('/upload', requireAuth, upload.single('file'), async (req, res) => {
   }
 });
 
-app.post('/ask', requireAuth, async (req, res) => {
+app.post('/ask', askRateLimit, requireAuth, async (req, res) => {
   try {
     const { question, document_id, session_id, messages } = req.body || {};
 
@@ -324,7 +370,7 @@ app.post('/ask', requireAuth, async (req, res) => {
   }
 });
 
-app.post('/ask/stream', async (req, res) => {
+app.post('/ask/stream', askRateLimit, requireAuth, async (req, res) => {
   try {
     const { question, document_id, session_id, messages } = req.body || {};
 
