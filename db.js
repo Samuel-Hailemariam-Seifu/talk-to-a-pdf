@@ -19,6 +19,7 @@ async function ensureSchema() {
       table.text('question').notNullable();
       table.text('answer').notNullable();
       table.text('context_chunk');
+      table.text('context_sources');
     });
     return;
   }
@@ -36,9 +37,16 @@ async function ensureSchema() {
       table.text('session_id');
     });
   }
+
+  const hasContextSources = await db.schema.hasColumn('chat_history', 'context_sources');
+  if (!hasContextSources) {
+    await db.schema.alterTable('chat_history', (table) => {
+      table.text('context_sources');
+    });
+  }
 }
 
-async function logInteraction({ documentId, sessionId, question, answer, contextChunk }) {
+async function logInteraction({ documentId, sessionId, question, answer, contextChunk, sources }) {
   try {
     await ensureSchema();
     await db('chat_history').insert({
@@ -47,6 +55,7 @@ async function logInteraction({ documentId, sessionId, question, answer, context
       question,
       answer,
       context_chunk: contextChunk,
+      context_sources: sources ? JSON.stringify(sources) : null,
     });
   } catch (err) {
     console.error('Failed to log interaction:', err);
