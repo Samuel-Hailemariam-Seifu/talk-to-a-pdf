@@ -10,6 +10,7 @@ It:
 - **Sends the selected chunks** as context to the Groq Chat Completions API (e.g. `llama-3.3-70b-versatile`)
 - Exposes a **`POST /upload`** endpoint to upload a PDF (multipart `file` or JSON `file_base64`) and receive a `document_id`
 - Exposes a **`POST /ask`** endpoint: `{ "question": "..." }`
+- Supports follow-up chat context via optional `session_id` and/or `messages` in `POST /ask`
 - Optionally **logs Q&A history** into a SQLite database using `knex`
 
 ---
@@ -189,12 +190,29 @@ curl -X POST http://localhost:3000/ask \
   -d "{\"question\":\"What are the warranty terms?\", \"document_id\":\"<YOUR_DOCUMENT_ID>\"}"
 ```
 
+Ask with explicit prior messages:
+
+```bash
+curl -X POST http://localhost:3000/ask \
+  -H "Content-Type: application/json" \
+  -d "{\"question\":\"What should I do next?\",\"document_id\":\"<YOUR_DOCUMENT_ID>\",\"messages\":[{\"role\":\"user\",\"content\":\"How do I install this?\"},{\"role\":\"assistant\",\"content\":\"Follow the setup section in chapter 2.\"}]}"
+```
+
+Ask with `session_id` (stored conversation):
+
+```bash
+curl -X POST http://localhost:3000/ask \
+  -H "Content-Type: application/json" \
+  -d "{\"question\":\"What about troubleshooting?\", \"document_id\":\"<YOUR_DOCUMENT_ID>\", \"session_id\":\"session-123\"}"
+```
+
 Example JSON response:
 
 ```json
 {
   "answer": "To reset the device, press and hold ...",
   "document_id": "f3c6f5b2-9f87-4ebd-8a9d-9ca2c3d8dbf9",
+  "session_id": "session-123",
   "contextPreview": "The reset procedure is described in section 3.2 ..."
 }
 ```
@@ -223,6 +241,8 @@ This project includes a small `db.js` module using **Knex** with **SQLite**:
 - Table: `chat_history`
   - `id` (auto‑increment)
   - `created_at` (timestamp)
+  - `document_id` (text)
+  - `session_id` (text)
   - `question` (text)
   - `answer` (text)
   - `context_chunk` (text)
@@ -230,7 +250,7 @@ This project includes a small `db.js` module using **Knex** with **SQLite**:
 On each successful `/ask` call, the server:
 
 - Ensures the `chat_history` table exists
-- Inserts a new row with the `question`, `answer`, and the `context_chunk` used
+- Inserts a new row with the `document_id`, `session_id`, `question`, `answer`, and the `context_chunk` used
 
 You can inspect the SQLite file (by default `chat_history.db`) with any SQLite client, or with a basic CLI like:
 
