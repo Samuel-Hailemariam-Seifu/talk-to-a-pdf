@@ -8,7 +8,7 @@ const Groq = require('groq-sdk');
 const multer = require('multer');
 const rateLimit = require('express-rate-limit');
 const jwt = require('jsonwebtoken');
-const { logInteraction } = require('./db');
+const { logInteraction, getHistory } = require('./db');
 const { getEmbedding, cosineSimilarity } = require('./lib/embeddings');
 
 const app = express();
@@ -458,6 +458,59 @@ app.get('/documents', async (req, res) => {
     res.json({ documents: getDocumentList() });
   } catch (err) {
     console.error('Error handling /documents:', err);
+    res.status(500).json({ error: err?.message || 'Unexpected server error.' });
+  }
+});
+
+app.get('/history', requireAuth, async (req, res) => {
+  try {
+    const maxLimit = 200;
+    const rawLimit = req.query.limit == null ? 50 : Number(req.query.limit);
+    const rawOffset = req.query.offset == null ? 0 : Number(req.query.offset);
+    const limit = Number.isFinite(rawLimit) ? Math.min(maxLimit, Math.max(1, Math.floor(rawLimit))) : NaN;
+    const offset = Number.isFinite(rawOffset) ? Math.max(0, Math.floor(rawOffset)) : NaN;
+    if (Number.isNaN(limit) || Number.isNaN(offset)) {
+      return res.status(400).json({ error: 'Invalid limit/offset. Use numeric values.' });
+    }
+
+    const since = typeof req.query.since === 'string' && req.query.since.trim() ? req.query.since.trim() : null;
+    if (since && Number.isNaN(new Date(since).getTime())) {
+      return res.status(400).json({ error: 'Invalid since value. Use an ISO date string.' });
+    }
+
+    const questionContains =
+      typeof req.query.question_contains === 'string' && req.query.question_contains.trim()
+        ? req.query.question_contains.trim()
+        : null;
+    const documentId =
+      typeof req.query.document_id === 'string' && req.query.document_id.trim()
+        ? req.query.document_id.trim()
+        : null;
+    const sessionId =
+      typeof req.query.session_id === 'string' && req.query.session_id.trim()
+        ? req.query.session_id.trim()
+        : null;
+
+    const items = await getHistory({
+      limit,
+      offset,
+      since,
+      questionContains,
+      documentId,
+      sessionId,
+    });
+
+    res.json({
+      items,
+      pagination: {
+        limit,
+        offset,
+        count: items.length,
+        max_limit: maxLimit,
+      },
+    });
+  } catch (err) {
+    console.error('Error handling /history:', err);
     res.status(500).json({ error: err?.message || 'Unexpected server error.' });
   }
 });

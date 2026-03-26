@@ -227,7 +227,49 @@ Example response:
 
 ---
 
-### 8. Using the `/ask` endpoints
+### 8. Querying chat history with `/history`
+
+Endpoint:
+- **Method**: `GET`
+- **URL**: `http://localhost:3000/history`
+
+Optional query params:
+- `limit` (default `50`, max `200`)
+- `offset` (default `0`)
+- `since` (ISO date, e.g. `2026-03-01T00:00:00Z`)
+- `question_contains` (substring filter)
+- `document_id`
+- `session_id`
+
+Example:
+
+```bash
+curl "http://localhost:3000/history?limit=20&offset=0&question_contains=reset&document_id=default"
+```
+
+Example response shape:
+
+```json
+{
+  "items": [
+    {
+      "id": 42,
+      "created_at": "2026-03-26 16:00:00",
+      "document_id": "default",
+      "session_id": "session-123",
+      "question": "How do I reset the device?",
+      "answer": "Press and hold the reset button...",
+      "context_chunk": "...",
+      "context_sources": [{ "chunk_index": 12, "snippet": "...", "text": "..." }]
+    }
+  ],
+  "pagination": { "limit": 20, "offset": 0, "count": 1, "max_limit": 200 }
+}
+```
+
+---
+
+### 9. Using the `/ask` endpoints
 
 Endpoint:
 - **Method**: `POST`
@@ -285,7 +327,7 @@ Example JSON response:
 
 ---
 
-### 9. How the RAG logic works
+### 10. How the RAG logic works
 
 - **PDF parsing**: On startup, the server reads `manual.pdf`; additional files can be added via `/upload`.
 - **Chunking with overlap**: The text is split into **overlapping windows** (e.g. 1000 characters, 200 character overlap) so boundaries don’t cut mid-sentence.
@@ -299,7 +341,7 @@ This is intentionally simple, but matches the basic **RAG** pattern: *retrieve r
 
 ---
 
-### 10. Database logging (bonus)
+### 11. Database logging (bonus)
 
 This project includes a small `db.js` module using **Knex** with **SQLite**:
 
@@ -328,7 +370,7 @@ If you want to adapt this to another SQL database (PostgreSQL, MySQL, etc.), adj
 
 ---
 
-### 11. Notes and next steps
+### 12. Notes and next steps
 
 - This is a **minimal RAG example**. For better relevance:
   - Replace keyword scoring with **embeddings + vector search**.
