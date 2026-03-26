@@ -28,6 +28,8 @@ const RERANK_TOP_N = Number(process.env.RAG_RERANK_TOP_N) || 2;
 
 /** @type {Map<string, { chunks: { text: string, embedding: number[] }[], sourceName?: string, uploadedAt: string }>} */
 const documentStore = new Map();
+/** @type {Map<string, { role: 'user' | 'assistant', content: string }[]>} */
+const sessionStore = new Map();
 let defaultPdfLoaded = false;
 let defaultPdfLoadError = null;
 
@@ -172,6 +174,53 @@ async function loadDefaultPdfOnce() {
   }
 }
 
+/**
+ * Validate and normalize chat history messages.
+ * @param {unknown} messages
+ * @returns {{ role: 'user' | 'assistant', content: string }[]}
+ */
+function normalizeMessages(messages) {
+  if (!Array.isArray(messages)) return [];
+  return messages
+    .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string')
+    .map((m) => ({ role: m.role, content: m.content.trim() }))
+    .filter((m) => m.content.length > 0);
+}
+
+/**
+ * Build effective prior messages from request and/or session.
+ * If messages are provided, they take precedence for this turn.
+ * @param {string | undefined} sessionId
+ * @param {unknown} messages
+ * @returns {{ sessionId: string | null, priorMessages: { role: 'user' | 'assistant', content: string }[] }}
+ */
+function resolveConversationContext(sessionId, messages) {
+  const normalizedMessages = normalizeMessages(messages);
+  const validSessionId = typeof sessionId === 'string' && sessionId.trim() ? sessionId.trim() : null;
+
+  if (normalizedMessages.length > 0) {
+    if (validSessionId) sessionStore.set(validSessionId, normalizedMessages);
+    return { sessionId: validSessionId, priorMessages: normalizedMessages };
+  }
+
+  if (validSessionId) {
+    const stored = sessionStore.get(validSessionId) || [];
+    return { sessionId: validSessionId, priorMessages: stored };
+  }
+
+  return { sessionId: null, priorMessages: [] };
+}
+
+function saveSessionTurn(sessionId, priorMessages, question, answer) {
+  if (!sessionId) return;
+  const updated = [
+    ...priorMessages,
+    { role: 'user', content: question },
+    { role: 'assistant', content: answer },
+  ];
+  sessionStore.set(sessionId, updated);
+}
+
 app.post('/upload', upload.single('file'), async (req, res) => {
   try {
     if (!process.env.OPENAI_API_KEY) {
@@ -219,7 +268,7 @@ app.post('/upload', upload.single('file'), async (req, res) => {
 
 app.post('/ask', async (req, res) => {
   try {
-    const { question, document_id } = req.body || {};
+    const { question, document_id, session_id, messages } = req.body || {};
 
     if (!question || typeof question !== 'string') {
       return res.status(400).json({ error: 'Request body must contain a string field "question".' });
@@ -265,18 +314,24 @@ app.post('/ask', async (req, res) => {
     let model = (process.env.GROQ_MODEL || 'llama-3.3-70b-versatile').replace(/^groq\//i, '');
     if (model === 'llama-3.1-8b-versatile') model = 'llama-3.1-8b-instant';
 
+    const { sessionId, priorMessages } = resolveConversationContext(session_id, messages);
+
     const completion = await groq.chat.completions.create({
       model,
       messages: [
         { role: 'system', content: systemPrompt },
+        ...priorMessages,
         { role: 'user', content: userPrompt },
       ],
       temperature: 0.2,
     });
 
     const answer = completion.choices?.[0]?.message?.content?.trim() || '';
+    saveSessionTurn(sessionId, priorMessages, question, answer);
 
     logInteraction({
+      documentId: requestedDocumentId,
+      sessionId,
       question,
       answer,
       contextChunk: context,
@@ -287,6 +342,7 @@ app.post('/ask', async (req, res) => {
     res.json({
       answer,
       document_id: requestedDocumentId,
+      session_id: sessionId,
       contextPreview: selectedChunks[0] ? selectedChunks[0].slice(0, 300) + (selectedChunks[0].length > 300 ? '...' : '') : null,
     });
   } catch (err) {
