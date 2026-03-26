@@ -10,6 +10,7 @@ It:
 - **Sends the selected chunks** as context to the Groq Chat Completions API (e.g. `llama-3.3-70b-versatile`)
 - Exposes a **`POST /upload`** endpoint to upload a PDF (multipart `file` or JSON `file_base64`) and receive a `document_id`
 - Exposes a **`POST /ask`** endpoint: `{ "question": "..." }`
+- Exposes a **`POST /ask/stream`** endpoint (SSE) for incremental answer tokens
 - Supports follow-up chat context via optional `session_id` and/or `messages` in `POST /ask`
 - Optionally **logs Q&A history** into a SQLite database using `knex`
 
@@ -219,7 +220,65 @@ Example JSON response:
 
 ---
 
-### 8. How the RAG logic works
+### 8. Streaming responses with `/ask/stream` (SSE)
+
+Endpoint:
+- **Method**: `POST`
+- **URL**: `http://localhost:3000/ask/stream`
+- **Body**: same shape as `/ask` (`question`, optional `document_id`, `session_id`, `messages`)
+
+SSE event format:
+- `event: token` with JSON payload: `{ "token": "<partial text>" }`
+- `event: done` with JSON payload: final result metadata and full answer
+- `event: error` with JSON payload: `{ "error": "..." }`
+
+Simple browser example:
+
+```html
+<script>
+  async function askStream() {
+    const res = await fetch('http://localhost:3000/ask/stream', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        question: 'Summarize chapter 1',
+        document_id: 'default',
+        session_id: 'demo-session'
+      }),
+    });
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      const events = buffer.split('\n\n');
+      buffer = events.pop() || '';
+      for (const evt of events) {
+        const eventType = (evt.match(/^event:\s*(.+)$/m) || [])[1];
+        const dataText = (evt.match(/^data:\s*(.+)$/m) || [])[1];
+        if (!eventType || !dataText) continue;
+        const data = JSON.parse(dataText);
+        if (eventType === 'token') {
+          console.log(data.token);
+        } else if (eventType === 'done') {
+          console.log('Final:', data);
+        } else if (eventType === 'error') {
+          console.error(data.error);
+        }
+      }
+    }
+  }
+</script>
+```
+
+---
+
+### 9. How the RAG logic works
 
 - **PDF parsing**: On startup, the server reads `manual.pdf`; uploaded files can also be added via `/upload`.
 - **Chunking with overlap**: The text is split into **overlapping windows** (e.g. 1000 characters, 200 character overlap) so boundaries don’t cut mid-sentence.
@@ -233,7 +292,7 @@ This is intentionally simple, but matches the basic **RAG** pattern: *retrieve r
 
 ---
 
-### 9. Database logging (bonus)
+### 10. Database logging (bonus)
 
 This project includes a small `db.js` module using **Knex** with **SQLite**:
 
@@ -262,7 +321,7 @@ If you want to adapt this to another SQL database (PostgreSQL, MySQL, etc.), adj
 
 ---
 
-### 10. Notes and next steps
+### 11. Notes and next steps
 
 - This is a **minimal RAG example**. For better relevance:
   - Replace keyword scoring with **embeddings + vector search**.
