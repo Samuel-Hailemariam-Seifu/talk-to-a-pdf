@@ -74,11 +74,11 @@ async function retrieveTopChunks(question, chunks, k = RETRIEVE_TOP_K) {
  * @param {string} question
  * @param {{ text: string, index: number }[]} chunks
  * @param {number} topN
- * @returns {Promise<string[]>}
+ * @returns {Promise<{ text: string, index: number }[]>}
  */
 async function rerankChunks(question, chunks, topN = RERANK_TOP_N) {
   if (chunks.length === 0) return [];
-  if (chunks.length <= topN) return chunks.map((c) => c.text);
+  if (chunks.length <= topN) return chunks.slice(0, topN).map((c) => ({ text: c.text, index: c.index }));
 
   const passageList = chunks
     .map((c, i) => `[${i + 1}]\n${c.text.slice(0, 400)}${c.text.length > 400 ? '...' : ''}`)
@@ -118,10 +118,10 @@ async function rerankChunks(question, chunks, topN = RERANK_TOP_N) {
     const idx = n - 1;
     if (!seen.has(idx)) {
       seen.add(idx);
-      selected.push(chunks[idx].text);
+      selected.push({ text: chunks[idx].text, index: chunks[idx].index });
     }
   }
-  if (selected.length === 0) return chunks.slice(0, topN).map((c) => c.text);
+  if (selected.length === 0) return chunks.slice(0, topN).map((c) => ({ text: c.text, index: c.index }));
   return selected;
 }
 
@@ -239,6 +239,14 @@ function buildAskPrompts(question, context) {
   return { systemPrompt, userPrompt };
 }
 
+function buildSources(selectedChunks) {
+  return selectedChunks.map((chunk) => ({
+    chunk_index: chunk.index,
+    snippet: chunk.text.slice(0, 400) + (chunk.text.length > 400 ? '...' : ''),
+    text: chunk.text,
+  }));
+}
+
 function resolveRequestedDocumentId(documentId) {
   return typeof documentId === 'string' && documentId.trim() ? documentId.trim() : 'default';
 }
@@ -267,8 +275,9 @@ async function resolveDocumentContext(question, requestedDocumentId) {
 
   const retrieved = await retrieveTopChunks(question, doc.chunks, RETRIEVE_TOP_K);
   const selectedChunks = await rerankChunks(question, retrieved, RERANK_TOP_N);
-  const context = selectedChunks.join('\n\n---\n\n');
-  return { selectedChunks, context };
+  const context = selectedChunks.map((c) => c.text).join('\n\n---\n\n');
+  const sources = buildSources(selectedChunks);
+  return { selectedChunks, context, sources };
 }
 
 app.post('/upload', upload.single('file'), async (req, res) => {
@@ -325,7 +334,7 @@ app.post('/ask', async (req, res) => {
     }
 
     const requestedDocumentId = resolveRequestedDocumentId(document_id);
-    const { selectedChunks, context } = await resolveDocumentContext(question, requestedDocumentId);
+    const { selectedChunks, context, sources } = await resolveDocumentContext(question, requestedDocumentId);
     const { systemPrompt, userPrompt } = buildAskPrompts(question, context);
 
     let model = (process.env.GROQ_MODEL || 'llama-3.3-70b-versatile').replace(/^groq\//i, '');
@@ -352,6 +361,7 @@ app.post('/ask', async (req, res) => {
       question,
       answer,
       contextChunk: context,
+      sources,
     }).catch((err) => {
       console.error('Failed to log chat interaction:', err);
     });
@@ -360,7 +370,10 @@ app.post('/ask', async (req, res) => {
       answer,
       document_id: requestedDocumentId,
       session_id: sessionId,
-      contextPreview: selectedChunks[0] ? selectedChunks[0].slice(0, 300) + (selectedChunks[0].length > 300 ? '...' : '') : null,
+      contextPreview: selectedChunks[0]
+        ? selectedChunks[0].text.slice(0, 300) + (selectedChunks[0].text.length > 300 ? '...' : '')
+        : null,
+      sources,
     });
   } catch (err) {
     console.error('Error handling /ask:', err);
@@ -378,7 +391,7 @@ app.post('/ask/stream', async (req, res) => {
     }
 
     const requestedDocumentId = resolveRequestedDocumentId(document_id);
-    const { selectedChunks, context } = await resolveDocumentContext(question, requestedDocumentId);
+    const { selectedChunks, context, sources } = await resolveDocumentContext(question, requestedDocumentId);
     const { systemPrompt, userPrompt } = buildAskPrompts(question, context);
     const { sessionId, priorMessages } = resolveConversationContext(session_id, messages);
 
@@ -423,6 +436,7 @@ app.post('/ask/stream', async (req, res) => {
         question,
         answer,
         contextChunk: context,
+        sources,
       });
 
       res.write(
@@ -431,8 +445,9 @@ app.post('/ask/stream', async (req, res) => {
           document_id: requestedDocumentId,
           session_id: sessionId,
           contextPreview: selectedChunks[0]
-            ? selectedChunks[0].slice(0, 300) + (selectedChunks[0].length > 300 ? '...' : '')
+            ? selectedChunks[0].text.slice(0, 300) + (selectedChunks[0].text.length > 300 ? '...' : '')
             : null,
+          sources,
         })}\n\n`
       );
       res.end();
