@@ -165,7 +165,11 @@ async function loadDefaultPdfOnce() {
     console.log(`Loaded default PDF with ${chunks.length} chunks (overlap=${CHUNK_OVERLAP}, embeddings ready).`);
   } catch (err) {
     defaultPdfLoadError = err;
-    console.error('Failed to load default PDF:', err);
+    if (err?.message && err.message.includes('PDF file not found')) {
+      console.warn('No default manual.pdf found. Upload a PDF via /upload to start querying documents.');
+    } else {
+      console.error('Failed to load default PDF:', err);
+    }
   }
 }
 
@@ -249,7 +253,7 @@ function resolveRequestedDocumentId(documentId) {
 async function resolveDocumentContext(question, requestedDocumentId) {
   await loadDefaultPdfOnce();
 
-  if (defaultPdfLoadError) {
+  if (defaultPdfLoadError && requestedDocumentId === 'default') {
     const err = new Error(defaultPdfLoadError.message || 'Failed to load PDF. Check server logs for details.');
     err.statusCode = 500;
     throw err;
