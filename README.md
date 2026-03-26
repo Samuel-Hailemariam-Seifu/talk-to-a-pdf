@@ -1,6 +1,6 @@
 ### PDF Chat Backend (Node.js + Express)
 
-This is a minimal Node.js backend that lets you **ask questions about a local `manual.pdf` file** using a simple RAG (Retrieval‑Augmented Generation) pattern with the **Groq API**.
+This is a minimal Node.js backend that lets you **ask questions about a local `manual.pdf` file or uploaded PDFs** using a simple RAG (Retrieval‑Augmented Generation) pattern with the **Groq API**.
 
 It:
 - **Parses a local PDF** with `pdf-parse`
@@ -8,6 +8,7 @@ It:
 - **Embeds** each chunk with OpenAI (`text-embedding-3-small`) and **retrieves** the top K chunks by **cosine similarity** to the question
 - **Re-ranks** those chunks with a quick Groq call to pick the best 1–2 for the final answer
 - **Sends the selected chunks** as context to the Groq Chat Completions API (e.g. `llama-3.3-70b-versatile`)
+- Exposes a **`POST /upload`** endpoint to upload a PDF (multipart `file` or JSON `file_base64`) and receive a `document_id`
 - Exposes a **`POST /ask`** endpoint: `{ "question": "..." }`
 - Optionally **logs Q&A history** into a SQLite database using `knex`
 
@@ -124,7 +125,42 @@ curl http://localhost:3000/health
 
 ---
 
-### 6. Using the `/ask` endpoint
+### 6. Uploading PDFs with `/upload`
+
+Endpoint:
+- **Method**: `POST`
+- **URL**: `http://localhost:3000/upload`
+
+Option A (multipart form):
+
+```bash
+curl -X POST http://localhost:3000/upload \
+  -F "file=@manual.pdf"
+```
+
+Option B (base64 JSON):
+
+```bash
+curl -X POST http://localhost:3000/upload \
+  -H "Content-Type: application/json" \
+  -d "{\"filename\":\"manual.pdf\",\"file_base64\":\"<BASE64_PDF_CONTENT>\"}"
+```
+
+Example response:
+
+```json
+{
+  "document_id": "f3c6f5b2-9f87-4ebd-8a9d-9ca2c3d8dbf9",
+  "source_name": "manual.pdf",
+  "chunk_count": 48
+}
+```
+
+Uploaded documents are processed in-memory for the current server session.
+
+---
+
+### 7. Using the `/ask` endpoint
 
 Endpoint:
 - **Method**: `POST`
@@ -145,20 +181,29 @@ curl -X POST http://localhost:3000/ask \
   -d "{\"question\": \"How do I reset the device?\"}"
 ```
 
+Ask against a previously uploaded document:
+
+```bash
+curl -X POST http://localhost:3000/ask \
+  -H "Content-Type: application/json" \
+  -d "{\"question\":\"What are the warranty terms?\", \"document_id\":\"<YOUR_DOCUMENT_ID>\"}"
+```
+
 Example JSON response:
 
 ```json
 {
   "answer": "To reset the device, press and hold ...",
+  "document_id": "f3c6f5b2-9f87-4ebd-8a9d-9ca2c3d8dbf9",
   "contextPreview": "The reset procedure is described in section 3.2 ..."
 }
 ```
 
 ---
 
-### 7. How the RAG logic works
+### 8. How the RAG logic works
 
-- **PDF parsing**: On startup, the server reads `manual.pdf` and uses `pdf-parse` to extract text.
+- **PDF parsing**: On startup, the server reads `manual.pdf`; uploaded files can also be added via `/upload`.
 - **Chunking with overlap**: The text is split into **overlapping windows** (e.g. 1000 characters, 200 character overlap) so boundaries don’t cut mid-sentence.
 - **Embeddings**: Each chunk is embedded with **OpenAI** (`text-embedding-3-small`); vectors are kept in memory for similarity search.
 - **Retrieval**: When you call `/ask`, the server:
@@ -170,7 +215,7 @@ This is intentionally simple, but matches the basic **RAG** pattern: *retrieve r
 
 ---
 
-### 8. Database logging (bonus)
+### 9. Database logging (bonus)
 
 This project includes a small `db.js` module using **Knex** with **SQLite**:
 
@@ -197,7 +242,7 @@ If you want to adapt this to another SQL database (PostgreSQL, MySQL, etc.), adj
 
 ---
 
-### 9. Notes and next steps
+### 10. Notes and next steps
 
 - This is a **minimal RAG example**. For better relevance:
   - Replace keyword scoring with **embeddings + vector search**.
