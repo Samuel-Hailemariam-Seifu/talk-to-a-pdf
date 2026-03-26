@@ -80,6 +80,18 @@ DB_FILE=./chat_history.db
 - **`RAG_RETRIEVE_TOP_K`** – number of chunks to retrieve by similarity (default 5).
 - **`RAG_RERANK_TOP_N`** – number of chunks to keep after re-ranking for the final prompt (default 2).
 - **`PORT`** (defaults to `3000`), **`DB_FILE`** (defaults to `./chat_history.db`)
+- Auth settings (all optional, backward-compatible defaults):
+  - `REQUIRE_AUTH=false` (set to `true` to protect endpoints)
+  - `AUTH_ALLOW_API_KEY=true`
+  - `AUTH_ALLOW_JWT=true`
+  - `AUTH_API_KEY` or `AUTH_API_KEYS=key1,key2`
+  - `AUTH_JWT_SECRET` (required for JWT validation)
+
+When `REQUIRE_AUTH=true`, `/ask` and `/upload` require valid credentials.
+- API key header: `X-API-Key: <key>`
+- Or bearer auth:
+  - API key as bearer: `Authorization: Bearer <api_key>`
+  - JWT as bearer: `Authorization: Bearer <jwt>`
 
 ---
 
@@ -186,6 +198,7 @@ Example with `curl`:
 ```bash
 curl -X POST http://localhost:3000/ask \
   -H "Content-Type: application/json" \
+  -H "X-API-Key: <your_api_key>" \
   -d "{\"question\": \"How do I reset the device?\"}"
 ```
 

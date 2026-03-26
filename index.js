@@ -6,6 +6,7 @@ const express = require('express');
 const { PDFParse } = require('pdf-parse');
 const Groq = require('groq-sdk');
 const multer = require('multer');
+const jwt = require('jsonwebtoken');
 const { logInteraction } = require('./db');
 const { getEmbedding, cosineSimilarity } = require('./lib/embeddings');
 
@@ -26,6 +27,16 @@ const CHUNK_SIZE = Number(process.env.RAG_CHUNK_SIZE) || 1000;
 const CHUNK_OVERLAP = Number(process.env.RAG_CHUNK_OVERLAP) || 200;
 const RETRIEVE_TOP_K = Number(process.env.RAG_RETRIEVE_TOP_K) || 5;
 const RERANK_TOP_N = Number(process.env.RAG_RERANK_TOP_N) || 2;
+const REQUIRE_AUTH = (process.env.REQUIRE_AUTH || 'false').toLowerCase() === 'true';
+const AUTH_ALLOW_API_KEY = (process.env.AUTH_ALLOW_API_KEY || 'true').toLowerCase() === 'true';
+const AUTH_ALLOW_JWT = (process.env.AUTH_ALLOW_JWT || 'true').toLowerCase() === 'true';
+const AUTH_JWT_SECRET = process.env.AUTH_JWT_SECRET || '';
+const API_KEYS = new Set(
+  [process.env.AUTH_API_KEY, ...(process.env.AUTH_API_KEYS || '').split(',')]
+    .filter(Boolean)
+    .map((k) => k.trim())
+    .filter(Boolean)
+);
 
 /** @type {Map<string, { chunks: { text: string, embedding: number[] }[], sourceName?: string, uploadedAt: string }>} */
 const documentStore = new Map();
@@ -33,6 +44,50 @@ const documentStore = new Map();
 const sessionStore = new Map();
 let defaultPdfLoaded = false;
 let defaultPdfLoadError = null;
+
+function unauthorized(res, message = 'Unauthorized.') {
+  return res.status(401).json({ error: message });
+}
+
+function requireAuth(req, res, next) {
+  if (!REQUIRE_AUTH) return next();
+
+  const canUseApiKey = AUTH_ALLOW_API_KEY && API_KEYS.size > 0;
+  const canUseJwt = AUTH_ALLOW_JWT && !!AUTH_JWT_SECRET;
+  if (!canUseApiKey && !canUseJwt) {
+    return res.status(500).json({
+      error: 'Authentication enabled but not configured. Set AUTH_API_KEY/AUTH_API_KEYS and/or AUTH_JWT_SECRET.',
+    });
+  }
+
+  const xApiKey = req.get('x-api-key');
+  if (canUseApiKey && xApiKey && API_KEYS.has(xApiKey.trim())) {
+    req.auth = { type: 'api_key' };
+    return next();
+  }
+
+  const authHeader = req.get('authorization') || '';
+  if (authHeader.startsWith('Bearer ')) {
+    const token = authHeader.slice('Bearer '.length).trim();
+
+    if (canUseApiKey && API_KEYS.has(token)) {
+      req.auth = { type: 'api_key' };
+      return next();
+    }
+
+    if (canUseJwt) {
+      try {
+        const payload = jwt.verify(token, AUTH_JWT_SECRET);
+        req.auth = { type: 'jwt', payload };
+        return next();
+      } catch (err) {
+        return unauthorized(res, 'Invalid authentication token.');
+      }
+    }
+  }
+
+  return unauthorized(res, 'Missing or invalid authentication credentials.');
+}
 
 /**
  * Chunk text with overlapping windows (e.g. 1000 chars with 200 overlap).
@@ -173,113 +228,7 @@ async function loadDefaultPdfOnce() {
   }
 }
 
-/**
- * Validate and normalize chat history messages.
- * @param {unknown} messages
- * @returns {{ role: 'user' | 'assistant', content: string }[]}
- */
-function normalizeMessages(messages) {
-  if (!Array.isArray(messages)) return [];
-  return messages
-    .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string')
-    .map((m) => ({ role: m.role, content: m.content.trim() }))
-    .filter((m) => m.content.length > 0);
-}
-
-/**
- * Build effective prior messages from request and/or session.
- * If messages are provided, they take precedence for this turn.
- * @param {string | undefined} sessionId
- * @param {unknown} messages
- * @returns {{ sessionId: string | null, priorMessages: { role: 'user' | 'assistant', content: string }[] }}
- */
-function resolveConversationContext(sessionId, messages) {
-  const normalizedMessages = normalizeMessages(messages);
-  const validSessionId = typeof sessionId === 'string' && sessionId.trim() ? sessionId.trim() : null;
-
-  if (normalizedMessages.length > 0) {
-    if (validSessionId) sessionStore.set(validSessionId, normalizedMessages);
-    return { sessionId: validSessionId, priorMessages: normalizedMessages };
-  }
-
-  if (validSessionId) {
-    const stored = sessionStore.get(validSessionId) || [];
-    return { sessionId: validSessionId, priorMessages: stored };
-  }
-
-  return { sessionId: null, priorMessages: [] };
-}
-
-function saveSessionTurn(sessionId, priorMessages, question, answer) {
-  if (!sessionId) return;
-  const updated = [
-    ...priorMessages,
-    { role: 'user', content: question },
-    { role: 'assistant', content: answer },
-  ];
-  sessionStore.set(sessionId, updated);
-}
-
-function buildAskPrompts(question, context) {
-  const systemPrompt =
-    'You are a helpful assistant that answers questions based primarily on the provided PDF manual context. ' +
-    'If the answer is not clearly supported by the context, say you are not sure and avoid making things up.';
-
-  const userPrompt = [
-    'PDF Context:',
-    '"""',
-    context || 'No relevant context found.',
-    '"""',
-    '',
-    'User question:',
-    question,
-  ].join('\n');
-
-  return { systemPrompt, userPrompt };
-}
-
-function buildSources(selectedChunks) {
-  return selectedChunks.map((chunk) => ({
-    chunk_index: chunk.index,
-    snippet: chunk.text.slice(0, 400) + (chunk.text.length > 400 ? '...' : ''),
-    text: chunk.text,
-  }));
-}
-
-function resolveRequestedDocumentId(documentId) {
-  return typeof documentId === 'string' && documentId.trim() ? documentId.trim() : 'default';
-}
-
-async function resolveDocumentContext(question, requestedDocumentId) {
-  await loadDefaultPdfOnce();
-
-  if (defaultPdfLoadError && requestedDocumentId === 'default') {
-    const err = new Error(defaultPdfLoadError.message || 'Failed to load PDF. Check server logs for details.');
-    err.statusCode = 500;
-    throw err;
-  }
-
-  const doc = documentStore.get(requestedDocumentId);
-  if (!doc) {
-    const err = new Error(`Document not found for document_id "${requestedDocumentId}".`);
-    err.statusCode = 404;
-    throw err;
-  }
-
-  if (doc.chunks.length === 0) {
-    const err = new Error('Document has no available chunks.');
-    err.statusCode = 500;
-    throw err;
-  }
-
-  const retrieved = await retrieveTopChunks(question, doc.chunks, RETRIEVE_TOP_K);
-  const selectedChunks = await rerankChunks(question, retrieved, RERANK_TOP_N);
-  const context = selectedChunks.map((c) => c.text).join('\n\n---\n\n');
-  const sources = buildSources(selectedChunks);
-  return { selectedChunks, context, sources };
-}
-
-app.post('/upload', upload.single('file'), async (req, res) => {
+app.post('/upload', requireAuth, upload.single('file'), async (req, res) => {
   try {
     let fileBuffer = req.file?.buffer;
     let sourceName = req.file?.originalname || 'uploaded.pdf';
@@ -318,7 +267,7 @@ app.post('/upload', upload.single('file'), async (req, res) => {
   }
 });
 
-app.post('/ask', async (req, res) => {
+app.post('/ask', requireAuth, async (req, res) => {
   try {
     const { question, document_id, session_id, messages } = req.body || {};
 
