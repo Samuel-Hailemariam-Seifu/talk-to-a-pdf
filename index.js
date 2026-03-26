@@ -28,6 +28,7 @@ const CHUNK_SIZE = Number(process.env.RAG_CHUNK_SIZE) || 1000;
 const CHUNK_OVERLAP = Number(process.env.RAG_CHUNK_OVERLAP) || 200;
 const RETRIEVE_TOP_K = Number(process.env.RAG_RETRIEVE_TOP_K) || 5;
 const RERANK_TOP_N = Number(process.env.RAG_RERANK_TOP_N) || 2;
+const READY_CHECK_GROQ = (process.env.READY_CHECK_GROQ || 'false').toLowerCase() === 'true';
 const REQUIRE_AUTH = (process.env.REQUIRE_AUTH || 'false').toLowerCase() === 'true';
 const AUTH_ALLOW_API_KEY = (process.env.AUTH_ALLOW_API_KEY || 'true').toLowerCase() === 'true';
 const AUTH_ALLOW_JWT = (process.env.AUTH_ALLOW_JWT || 'true').toLowerCase() === 'true';
@@ -463,6 +464,51 @@ app.get('/documents', async (req, res) => {
 
 app.get('/health', (req, res) => {
   res.json({ status: 'ok' });
+});
+
+app.get('/ready', async (req, res) => {
+  try {
+    await loadDefaultPdfOnce();
+
+    if (defaultPdfLoadError) {
+      return res.status(503).json({
+        status: 'not_ready',
+        reason: defaultPdfLoadError.message || 'Default PDF failed to load.',
+      });
+    }
+
+    const defaultDoc = documentStore.get('default');
+    if (!defaultDoc || !Array.isArray(defaultDoc.chunks) || defaultDoc.chunks.length === 0) {
+      return res.status(503).json({
+        status: 'not_ready',
+        reason: 'Default PDF is not loaded or has no chunks.',
+      });
+    }
+
+    if (READY_CHECK_GROQ) {
+      if (!process.env.GROQ_API_KEY) {
+        return res.status(503).json({
+          status: 'not_ready',
+          reason: 'READY_CHECK_GROQ is enabled but GROQ_API_KEY is missing.',
+        });
+      }
+      await groq.models.list();
+    }
+
+    res.json({
+      status: 'ready',
+      checks: {
+        default_pdf_loaded: true,
+        default_pdf_chunk_count: defaultDoc.chunks.length,
+        groq_checked: READY_CHECK_GROQ,
+      },
+    });
+  } catch (err) {
+    res.status(503).json({
+      status: 'not_ready',
+      reason: err?.message || 'Readiness check failed.',
+    });
+  }
 });
 
 app.listen(PORT, () => {

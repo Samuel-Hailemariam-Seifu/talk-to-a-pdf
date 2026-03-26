@@ -145,6 +145,16 @@ Health check:
 curl http://localhost:3000/health
 ```
 
+Readiness check:
+
+```bash
+curl http://localhost:3000/ready
+```
+
+- `/health` = liveness only (process is up).
+- `/ready` = readiness (default PDF loaded/chunked/embedded and ready for RAG).
+- Optional: set `READY_CHECK_GROQ=true` to make `/ready` also verify Groq API reachability.
+
 Open the simple web UI:
 
 - Visit `http://localhost:3000`
