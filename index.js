@@ -172,6 +172,71 @@ async function loadDefaultPdfOnce() {
   }
 }
 
+function getDocumentList() {
+  return Array.from(documentStore.entries()).map(([documentId, doc]) => ({
+    document_id: documentId,
+    source_name: doc.sourceName || null,
+    chunk_count: doc.chunks.length,
+    uploaded_at: doc.uploadedAt,
+  }));
+}
+
+async function handleAsk(question, requestedDocumentId) {
+  await loadDefaultPdfOnce();
+
+  if (defaultPdfLoadError) {
+    const err = new Error(defaultPdfLoadError.message || 'Failed to load PDF. Check server logs for details.');
+    err.statusCode = 500;
+    throw err;
+  }
+
+  const doc = documentStore.get(requestedDocumentId);
+  if (!doc) {
+    const err = new Error(`Document not found for document_id "${requestedDocumentId}".`);
+    err.statusCode = 404;
+    throw err;
+  }
+
+  if (doc.chunks.length === 0) {
+    const err = new Error('Document has no available chunks.');
+    err.statusCode = 500;
+    throw err;
+  }
+
+  const retrieved = await retrieveTopChunks(question, doc.chunks, RETRIEVE_TOP_K);
+  const selectedChunks = await rerankChunks(question, retrieved, RERANK_TOP_N);
+  const context = selectedChunks.join('\n\n---\n\n');
+
+  const systemPrompt =
+    'You are a helpful assistant that answers questions based primarily on the provided PDF manual context. ' +
+    'If the answer is not clearly supported by the context, say you are not sure and avoid making things up.';
+
+  const userPrompt = [
+    'PDF Context:',
+    '"""',
+    context || 'No relevant context found.',
+    '"""',
+    '',
+    'User question:',
+    question,
+  ].join('\n');
+
+  let model = (process.env.GROQ_MODEL || 'llama-3.3-70b-versatile').replace(/^groq\//i, '');
+  if (model === 'llama-3.1-8b-versatile') model = 'llama-3.1-8b-instant';
+
+  const completion = await groq.chat.completions.create({
+    model,
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userPrompt },
+    ],
+    temperature: 0.2,
+  });
+
+  const answer = completion.choices?.[0]?.message?.content?.trim() || '';
+  return { answer, context, selectedChunks };
+}
+
 app.post('/upload', upload.single('file'), async (req, res) => {
   try {
     if (!process.env.OPENAI_API_KEY) {
@@ -225,58 +290,12 @@ app.post('/ask', async (req, res) => {
       return res.status(400).json({ error: 'Request body must contain a string field "question".' });
     }
 
-    await loadDefaultPdfOnce();
-
-    if (defaultPdfLoadError) {
-      return res.status(500).json({
-        error: defaultPdfLoadError.message || 'Failed to load PDF. Check server logs for details.',
-      });
-    }
-
     const requestedDocumentId =
       typeof document_id === 'string' && document_id.trim() ? document_id.trim() : 'default';
-    const doc = documentStore.get(requestedDocumentId);
-    if (!doc) {
-      return res.status(404).json({ error: `Document not found for document_id "${requestedDocumentId}".` });
-    }
-
-    if (doc.chunks.length === 0) {
-      return res.status(500).json({ error: 'Document has no available chunks.' });
-    }
-
-    const retrieved = await retrieveTopChunks(question, doc.chunks, RETRIEVE_TOP_K);
-    const selectedChunks = await rerankChunks(question, retrieved, RERANK_TOP_N);
-    const context = selectedChunks.join('\n\n---\n\n');
-
-    const systemPrompt =
-      'You are a helpful assistant that answers questions based primarily on the provided PDF manual context. ' +
-      'If the answer is not clearly supported by the context, say you are not sure and avoid making things up.';
-
-    const userPrompt = [
-      'PDF Context:',
-      '"""',
-      context || 'No relevant context found.',
-      '"""',
-      '',
-      'User question:',
-      question,
-    ].join('\n');
-
-    let model = (process.env.GROQ_MODEL || 'llama-3.3-70b-versatile').replace(/^groq\//i, '');
-    if (model === 'llama-3.1-8b-versatile') model = 'llama-3.1-8b-instant';
-
-    const completion = await groq.chat.completions.create({
-      model,
-      messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: userPrompt },
-      ],
-      temperature: 0.2,
-    });
-
-    const answer = completion.choices?.[0]?.message?.content?.trim() || '';
+    const { answer, context, selectedChunks } = await handleAsk(question, requestedDocumentId);
 
     logInteraction({
+      documentId: requestedDocumentId,
       question,
       answer,
       contextChunk: context,
@@ -292,7 +311,52 @@ app.post('/ask', async (req, res) => {
   } catch (err) {
     console.error('Error handling /ask:', err);
     const message = err?.message || 'Unexpected server error.';
-    res.status(500).json({ error: message });
+    res.status(err?.statusCode || 500).json({ error: message });
+  }
+});
+
+app.post('/documents/:id/ask', async (req, res) => {
+  try {
+    const { question } = req.body || {};
+    const requestedDocumentId = req.params.id;
+    if (!question || typeof question !== 'string') {
+      return res.status(400).json({ error: 'Request body must contain a string field "question".' });
+    }
+
+    const { answer, context, selectedChunks } = await handleAsk(question, requestedDocumentId);
+    logInteraction({
+      documentId: requestedDocumentId,
+      question,
+      answer,
+      contextChunk: context,
+    }).catch((err) => {
+      console.error('Failed to log chat interaction:', err);
+    });
+
+    res.json({
+      answer,
+      document_id: requestedDocumentId,
+      contextPreview: selectedChunks[0] ? selectedChunks[0].slice(0, 300) + (selectedChunks[0].length > 300 ? '...' : '') : null,
+    });
+  } catch (err) {
+    console.error('Error handling /documents/:id/ask:', err);
+    res.status(err?.statusCode || 500).json({ error: err?.message || 'Unexpected server error.' });
+  }
+});
+
+app.get('/documents', async (req, res) => {
+  try {
+    await loadDefaultPdfOnce();
+    if (defaultPdfLoadError && documentStore.size === 0) {
+      return res.status(500).json({
+        error: defaultPdfLoadError.message || 'Failed to load default PDF.',
+      });
+    }
+
+    res.json({ documents: getDocumentList() });
+  } catch (err) {
+    console.error('Error handling /documents:', err);
+    res.status(500).json({ error: err?.message || 'Unexpected server error.' });
   }
 });
 
