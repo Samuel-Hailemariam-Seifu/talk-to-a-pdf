@@ -1,9 +1,11 @@
 require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
+const { randomUUID } = require('crypto');
 const express = require('express');
 const { PDFParse } = require('pdf-parse');
 const Groq = require('groq-sdk');
+const multer = require('multer');
 const { logInteraction } = require('./db');
 const { getEmbedding, cosineSimilarity } = require('./lib/embeddings');
 
@@ -15,6 +17,7 @@ const groq = new Groq({
 });
 
 app.use(express.json());
+const upload = multer();
 
 const PDF_PATH = path.join(__dirname, 'manual.pdf');
 
@@ -23,10 +26,10 @@ const CHUNK_OVERLAP = Number(process.env.RAG_CHUNK_OVERLAP) || 200;
 const RETRIEVE_TOP_K = Number(process.env.RAG_RETRIEVE_TOP_K) || 5;
 const RERANK_TOP_N = Number(process.env.RAG_RERANK_TOP_N) || 2;
 
-/** @type {{ text: string, embedding: number[] }[]} */
-let pdfChunks = [];
-let pdfTextLoaded = false;
-let pdfLoadError = null;
+/** @type {Map<string, { chunks: { text: string, embedding: number[] }[], sourceName?: string, uploadedAt: string }>} */
+const documentStore = new Map();
+let defaultPdfLoaded = false;
+let defaultPdfLoadError = null;
 
 /**
  * Chunk text with overlapping windows (e.g. 1000 chars with 200 overlap).
@@ -120,8 +123,28 @@ async function rerankChunks(question, chunks, topN = RERANK_TOP_N) {
   return selected;
 }
 
-async function loadPdfOnce() {
-  if (pdfTextLoaded || pdfLoadError) return;
+async function processPdfBuffer(dataBuffer, sourceName = 'uploaded.pdf') {
+  const parser = new PDFParse({ data: dataBuffer });
+  const textResult = await parser.getText();
+  await parser.destroy();
+
+  const rawChunks = chunkTextWithOverlap(textResult.text || '', CHUNK_SIZE, CHUNK_OVERLAP);
+  if (rawChunks.length === 0) {
+    throw new Error('PDF text is empty or could not be chunked.');
+  }
+
+  const chunks = [];
+  for (let i = 0; i < rawChunks.length; i++) {
+    const embedding = await getEmbedding(rawChunks[i]);
+    chunks.push({ text: rawChunks[i], embedding });
+    if ((i + 1) % 10 === 0) console.log(`Embedded ${i + 1}/${rawChunks.length} chunks for ${sourceName}...`);
+  }
+
+  return chunks;
+}
+
+async function loadDefaultPdfOnce() {
+  if (defaultPdfLoaded || defaultPdfLoadError) return;
 
   try {
     if (!fs.existsSync(PDF_PATH)) {
@@ -135,48 +158,93 @@ async function loadPdfOnce() {
     }
 
     const dataBuffer = fs.readFileSync(PDF_PATH);
-    const parser = new PDFParse({ data: dataBuffer });
-    const textResult = await parser.getText();
-    await parser.destroy();
-
-    const rawChunks = chunkTextWithOverlap(textResult.text || '', CHUNK_SIZE, CHUNK_OVERLAP);
-    pdfChunks = [];
-
-    for (let i = 0; i < rawChunks.length; i++) {
-      const embedding = await getEmbedding(rawChunks[i]);
-      pdfChunks.push({ text: rawChunks[i], embedding });
-      if ((i + 1) % 10 === 0) console.log(`Embedded ${i + 1}/${rawChunks.length} chunks...`);
-    }
-
-    pdfTextLoaded = true;
-    console.log(`Loaded PDF with ${pdfChunks.length} chunks (overlap=${CHUNK_OVERLAP}, embeddings ready).`);
+    const chunks = await processPdfBuffer(dataBuffer, path.basename(PDF_PATH));
+    documentStore.set('default', {
+      chunks,
+      sourceName: path.basename(PDF_PATH),
+      uploadedAt: new Date().toISOString(),
+    });
+    defaultPdfLoaded = true;
+    console.log(`Loaded default PDF with ${chunks.length} chunks (overlap=${CHUNK_OVERLAP}, embeddings ready).`);
   } catch (err) {
-    pdfLoadError = err;
-    console.error('Failed to load PDF:', err);
+    defaultPdfLoadError = err;
+    console.error('Failed to load default PDF:', err);
   }
 }
 
+app.post('/upload', upload.single('file'), async (req, res) => {
+  try {
+    if (!process.env.OPENAI_API_KEY) {
+      return res.status(500).json({
+        error: 'OPENAI_API_KEY is required for embedding-based RAG. Add it to your .env (see .env.example).',
+      });
+    }
+
+    let fileBuffer = req.file?.buffer;
+    let sourceName = req.file?.originalname || 'uploaded.pdf';
+
+    if (!fileBuffer) {
+      const { file_base64, filename } = req.body || {};
+      if (typeof file_base64 === 'string' && file_base64.trim()) {
+        const cleanBase64 = file_base64.includes(',') ? file_base64.split(',').pop() : file_base64;
+        fileBuffer = Buffer.from(cleanBase64, 'base64');
+        sourceName = typeof filename === 'string' && filename.trim() ? filename.trim() : 'uploaded.pdf';
+      }
+    }
+
+    if (!fileBuffer || fileBuffer.length === 0) {
+      return res.status(400).json({
+        error: 'Upload a PDF via multipart field "file" or JSON body field "file_base64".',
+      });
+    }
+
+    const documentId = randomUUID();
+    const chunks = await processPdfBuffer(fileBuffer, sourceName);
+    documentStore.set(documentId, {
+      chunks,
+      sourceName,
+      uploadedAt: new Date().toISOString(),
+    });
+
+    res.status(201).json({
+      document_id: documentId,
+      source_name: sourceName,
+      chunk_count: chunks.length,
+    });
+  } catch (err) {
+    console.error('Error handling /upload:', err);
+    res.status(400).json({ error: err?.message || 'Failed to process uploaded PDF.' });
+  }
+});
+
 app.post('/ask', async (req, res) => {
   try {
-    const { question } = req.body || {};
+    const { question, document_id } = req.body || {};
 
     if (!question || typeof question !== 'string') {
       return res.status(400).json({ error: 'Request body must contain a string field "question".' });
     }
 
-    await loadPdfOnce();
+    await loadDefaultPdfOnce();
 
-    if (pdfLoadError) {
+    if (defaultPdfLoadError) {
       return res.status(500).json({
-        error: pdfLoadError.message || 'Failed to load PDF. Check server logs for details.',
+        error: defaultPdfLoadError.message || 'Failed to load PDF. Check server logs for details.',
       });
     }
 
-    if (!pdfTextLoaded || pdfChunks.length === 0) {
-      return res.status(500).json({ error: 'PDF text is empty or could not be chunked.' });
+    const requestedDocumentId =
+      typeof document_id === 'string' && document_id.trim() ? document_id.trim() : 'default';
+    const doc = documentStore.get(requestedDocumentId);
+    if (!doc) {
+      return res.status(404).json({ error: `Document not found for document_id "${requestedDocumentId}".` });
     }
 
-    const retrieved = await retrieveTopChunks(question, pdfChunks, RETRIEVE_TOP_K);
+    if (doc.chunks.length === 0) {
+      return res.status(500).json({ error: 'Document has no available chunks.' });
+    }
+
+    const retrieved = await retrieveTopChunks(question, doc.chunks, RETRIEVE_TOP_K);
     const selectedChunks = await rerankChunks(question, retrieved, RERANK_TOP_N);
     const context = selectedChunks.join('\n\n---\n\n');
 
@@ -218,6 +286,7 @@ app.post('/ask', async (req, res) => {
 
     res.json({
       answer,
+      document_id: requestedDocumentId,
       contextPreview: selectedChunks[0] ? selectedChunks[0].slice(0, 300) + (selectedChunks[0].length > 300 ? '...' : '') : null,
     });
   } catch (err) {
@@ -233,7 +302,7 @@ app.get('/health', (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`PDF chat backend listening on http://localhost:${PORT}`);
-  loadPdfOnce().catch((err) => {
+  loadDefaultPdfOnce().catch((err) => {
     console.error('Error preloading PDF:', err);
   });
 });
