@@ -154,12 +154,6 @@ async function loadDefaultPdfOnce() {
       throw new Error(`PDF file not found at ${PDF_PATH}`);
     }
 
-    if (!process.env.OPENAI_API_KEY) {
-      throw new Error(
-        'OPENAI_API_KEY is required for embedding-based RAG. Add it to your .env (see .env.example).'
-      );
-    }
-
     const dataBuffer = fs.readFileSync(PDF_PATH);
     const chunks = await processPdfBuffer(dataBuffer, path.basename(PDF_PATH));
     documentStore.set('default', {
@@ -283,12 +277,6 @@ async function resolveDocumentContext(question, requestedDocumentId) {
 
 app.post('/upload', upload.single('file'), async (req, res) => {
   try {
-    if (!process.env.OPENAI_API_KEY) {
-      return res.status(500).json({
-        error: 'OPENAI_API_KEY is required for embedding-based RAG. Add it to your .env (see .env.example).',
-      });
-    }
-
     let fileBuffer = req.file?.buffer;
     let sourceName = req.file?.originalname || 'uploaded.pdf';
 
