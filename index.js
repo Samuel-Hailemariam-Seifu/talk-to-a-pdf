@@ -6,6 +6,7 @@ const express = require('express');
 const { PDFParse } = require('pdf-parse');
 const Groq = require('groq-sdk');
 const multer = require('multer');
+const jwt = require('jsonwebtoken');
 const { logInteraction } = require('./db');
 const { getEmbedding, cosineSimilarity } = require('./lib/embeddings');
 
@@ -25,11 +26,65 @@ const CHUNK_SIZE = Number(process.env.RAG_CHUNK_SIZE) || 1000;
 const CHUNK_OVERLAP = Number(process.env.RAG_CHUNK_OVERLAP) || 200;
 const RETRIEVE_TOP_K = Number(process.env.RAG_RETRIEVE_TOP_K) || 5;
 const RERANK_TOP_N = Number(process.env.RAG_RERANK_TOP_N) || 2;
+const REQUIRE_AUTH = (process.env.REQUIRE_AUTH || 'false').toLowerCase() === 'true';
+const AUTH_ALLOW_API_KEY = (process.env.AUTH_ALLOW_API_KEY || 'true').toLowerCase() === 'true';
+const AUTH_ALLOW_JWT = (process.env.AUTH_ALLOW_JWT || 'true').toLowerCase() === 'true';
+const AUTH_JWT_SECRET = process.env.AUTH_JWT_SECRET || '';
+const API_KEYS = new Set(
+  [process.env.AUTH_API_KEY, ...(process.env.AUTH_API_KEYS || '').split(',')]
+    .filter(Boolean)
+    .map((k) => k.trim())
+    .filter(Boolean)
+);
 
 /** @type {Map<string, { chunks: { text: string, embedding: number[] }[], sourceName?: string, uploadedAt: string }>} */
 const documentStore = new Map();
 let defaultPdfLoaded = false;
 let defaultPdfLoadError = null;
+
+function unauthorized(res, message = 'Unauthorized.') {
+  return res.status(401).json({ error: message });
+}
+
+function requireAuth(req, res, next) {
+  if (!REQUIRE_AUTH) return next();
+
+  const canUseApiKey = AUTH_ALLOW_API_KEY && API_KEYS.size > 0;
+  const canUseJwt = AUTH_ALLOW_JWT && !!AUTH_JWT_SECRET;
+  if (!canUseApiKey && !canUseJwt) {
+    return res.status(500).json({
+      error: 'Authentication enabled but not configured. Set AUTH_API_KEY/AUTH_API_KEYS and/or AUTH_JWT_SECRET.',
+    });
+  }
+
+  const xApiKey = req.get('x-api-key');
+  if (canUseApiKey && xApiKey && API_KEYS.has(xApiKey.trim())) {
+    req.auth = { type: 'api_key' };
+    return next();
+  }
+
+  const authHeader = req.get('authorization') || '';
+  if (authHeader.startsWith('Bearer ')) {
+    const token = authHeader.slice('Bearer '.length).trim();
+
+    if (canUseApiKey && API_KEYS.has(token)) {
+      req.auth = { type: 'api_key' };
+      return next();
+    }
+
+    if (canUseJwt) {
+      try {
+        const payload = jwt.verify(token, AUTH_JWT_SECRET);
+        req.auth = { type: 'jwt', payload };
+        return next();
+      } catch (err) {
+        return unauthorized(res, 'Invalid authentication token.');
+      }
+    }
+  }
+
+  return unauthorized(res, 'Missing or invalid authentication credentials.');
+}
 
 /**
  * Chunk text with overlapping windows (e.g. 1000 chars with 200 overlap).
@@ -172,7 +227,7 @@ async function loadDefaultPdfOnce() {
   }
 }
 
-app.post('/upload', upload.single('file'), async (req, res) => {
+app.post('/upload', requireAuth, upload.single('file'), async (req, res) => {
   try {
     if (!process.env.OPENAI_API_KEY) {
       return res.status(500).json({
@@ -217,7 +272,7 @@ app.post('/upload', upload.single('file'), async (req, res) => {
   }
 });
 
-app.post('/ask', async (req, res) => {
+app.post('/ask', requireAuth, async (req, res) => {
   try {
     const { question, document_id } = req.body || {};
 
